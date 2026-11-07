@@ -23,7 +23,7 @@ def _sample_kwargs(eq, capacity):
 # --- Integridad del catálogo ---------------------------------------------
 
 def test_catalog_size_and_unique_keys():
-    assert len(EQUIPMENT_LIST) == len(EQUIPMENT) == 46
+    assert len(EQUIPMENT_LIST) == len(EQUIPMENT) == 96
 
 
 @pytest.mark.parametrize("eq", EQUIPMENT_LIST, ids=lambda e: e.key)

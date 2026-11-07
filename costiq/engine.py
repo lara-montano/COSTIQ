@@ -99,23 +99,27 @@ def _band_factor(option: PressureOption, P: float) -> tuple[float, bool]:
 
 def pressure_factor(eq: Equipment, P: float, option: str | None = None
                     ) -> tuple[float, list[Notice]]:
-    """F_P para equipos con correlación de la Tabla A.2 (Ec. A.3). P en barg."""
+    """F_P para equipos con correlación de la Tabla A.2 (Ec. A.3).
+
+    P en barg, salvo ventiladores (ΔP en kPa; ver `Equipment.pressure_unit`).
+    """
     opt = eq.pressure_option(option)
     if opt is None:
         return 1.0, []
+    u = eq.pressure_unit
     notes: list[Notice] = []
     fp, extrapolated = _band_factor(opt, P)
     if extrapolated:
         if all(b.is_flat for b in opt.bands):
-            text = (f"La presión ({P:g} barg) supera el máximo tabulado para este equipo "
-                    f"({opt.p_max:g} barg). El libro no da corrección por presión; "
+            text = (f"La presión ({P:g} {u}) supera el máximo tabulado para este equipo "
+                    f"({opt.p_max:g} {u}). El libro no da corrección por presión; "
                     "F_P = 1 no representa el costo real.")
             if eq.category.startswith("Tanques"):
                 text = (f"Los tanques API son atmosféricos (P < {opt.p_max:g} barg). "
                         f"Para {P:g} barg usa un recipiente de proceso.")
         else:
-            text = (f"La presión ({P:g} barg) supera el rango de la Tabla A.2 "
-                    f"({opt.p_max:g} barg). F_P se extrapoló; el libro pide usarlo con "
+            text = (f"La presión ({P:g} {u}) supera el rango de la Tabla A.2 "
+                    f"({opt.p_max:g} {u}). F_P se extrapoló; el libro pide usarlo con "
                     "extrema precaución.")
         notes.append(Notice("warning", text))
     return fp, notes
@@ -150,6 +154,13 @@ def vessel_pressure_factor(P: float, D: float) -> tuple[float, float | None, lis
             "válida para pared delgada (≈320 barg o menos para D de 0.3 a 4 m).",
         ))
     return fp, t, notes
+
+
+def superheat_factor(dT: float) -> float:
+    """F_T de calderas de vapor (Tabla A.5). ΔT = sobrecalentamiento en °C."""
+    if dT < 0:
+        raise CostError("El sobrecalentamiento no puede ser negativo.")
+    return 1.0 + 0.00184 * dT - 0.00000335 * dT * dT
 
 
 def tray_quantity_factor(N: int) -> float:
@@ -197,6 +208,7 @@ class CostResult:
     CBM_unit: float
     CBM0_unit: float
     Cp_base_unit: float
+    FT: float = 1.0
     thickness: float | None = None
     notices: list[Notice] = field(default_factory=list)
 
@@ -243,6 +255,7 @@ def cost(
     trays: int = 1,
     units: int = 1,
     fbm_override: float | None = None,
+    superheat: float = 0.0,
 ) -> CostResult:
     """Costo de módulo desnudo de un equipo (Ec. A.4 o Tabla A.5).
 
@@ -256,7 +269,8 @@ def cost(
         diameter, length: geometría de recipientes y torres (m).
         trays: número de platos (solo método "tray").
         units: número de unidades idénticas en paralelo.
-        fbm_override: F_BM definido por el usuario (solo método "FBM").
+        fbm_override: F_BM definido por el usuario (equipos con F_BM no tabulado).
+        superheat: sobrecalentamiento en °C (solo calderas de vapor).
     """
     eq = EQUIPMENT[equipment] if isinstance(equipment, str) else equipment
     if units < 1:
@@ -277,7 +291,7 @@ def cost(
     Cp0, cap_notes = purchased_cost(eq, capacity)
     notes += cap_notes
 
-    FM = FP = Fq = 1.0
+    FM = FP = Fq = FT = 1.0
     thickness = None
     method = eq.method
 
@@ -302,11 +316,14 @@ def cost(
         CBM0_unit = Cp0 * FBM0
         Cp_base_unit = Cp0
     elif method == "FBM_FP":
-        FBM = mat.factor
+        FBM = fbm_override if fbm_override is not None else mat.factor
+        FBM0 = fbm_override if fbm_override is not None else eq.base_material.factor
         FP, p_notes = pressure_factor(eq, pressure, pressure_option)
         notes += p_notes
-        CBM_unit = Cp0 * FBM * FP
-        CBM0_unit = Cp0 * eq.base_material.factor
+        if eq.superheat:
+            FT = superheat_factor(superheat)
+        CBM_unit = Cp0 * FBM * FP * FT
+        CBM0_unit = Cp0 * FBM0
         Cp_base_unit = Cp0
     elif method == "tray":
         if trays < 1:
@@ -328,7 +345,88 @@ def cost(
         diameter=diameter, length=length, trays=trays if method == "tray" else 1,
         Cp0=Cp0, FM=FM, FP=FP, FBM=FBM, Fq=Fq,
         CBM_unit=CBM_unit, CBM0_unit=CBM0_unit, Cp_base_unit=Cp_base_unit,
-        thickness=thickness, notices=notes,
+        FT=FT, thickness=thickness, notices=notes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Equipo con cotización propia (Ec. 7.1)
+# ---------------------------------------------------------------------------
+
+QUOTE_KEY = "custom"
+QUOTE_CATEGORY = "Cotización propia"
+
+
+def quoted_cost(
+    name: str,
+    capacity: float,
+    unit: str,
+    ref_cost: float,
+    ref_capacity: float,
+    ref_cepci: float,
+    exponent: float = 0.6,
+    fbm: float = 1.0,
+    units: int = 1,
+) -> CostResult:
+    """Costo de un equipo a partir de una cotización de referencia.
+
+    Escala el precio con la Ec. 7.1, C = C_ref (S / S_ref)^n, lo lleva a la base
+    de las correlaciones (CEPCI = 397) y le aplica un F_BM del usuario. Sirve para
+    equipos sin correlación en el Apéndice A (molinos, extrusores, membranas...).
+
+    Parámetros:
+        name, unit: nombre del equipo y unidad de su atributo de tamaño.
+        capacity: tamaño por unidad del equipo que se quiere costear.
+        ref_cost: precio de compra de referencia, en USD del año de la cotización.
+        ref_capacity: tamaño del equipo cotizado, en la misma unidad.
+        ref_cepci: CEPCI de la fecha de la cotización.
+        exponent: exponente de costo n (0.6 = regla de los seis décimos).
+        fbm: factor de módulo desnudo; 1.0 equivale a solo el costo de compra.
+        units: número de unidades idénticas.
+    """
+    for label, v in (("La capacidad", capacity), ("El precio de referencia", ref_cost),
+                     ("La capacidad de referencia", ref_capacity),
+                     ("El CEPCI de la cotización", ref_cepci)):
+        if v is None or v <= 0:
+            raise CostError(f"{label} debe ser positivo.")
+    if not 0 < exponent <= 1.5:
+        raise CostError("El exponente de costo debe estar entre 0 y 1.5.")
+    if fbm < 1.0:
+        raise CostError("El F_BM no puede ser menor que 1 (sería menos que el costo de compra).")
+    if units < 1:
+        raise CostError("El número de unidades debe ser al menos 1.")
+
+    eq = Equipment(
+        key=QUOTE_KEY, category=QUOTE_CATEGORY, name=name.strip() or "Equipo cotizado",
+        name_en="", K1=0.0, K2=0.0, K3=0.0, attribute="Tamaño", unit=unit.strip() or "u",
+        a_min=ref_capacity / 10.0, a_max=ref_capacity * 10.0, method="quote",
+        materials=(Material("—", "Según cotización", fbm, "Cotización del usuario"),),
+    )
+    ratio = capacity / ref_capacity
+    Cp0 = ref_cost * ratio ** exponent * CEPCI_BASE / ref_cepci
+    notes: list[Notice] = []
+    if not 0.1 <= ratio <= 10.0:
+        notes.append(Notice(
+            "warning",
+            f"El tamaño es {ratio:,.3g} veces el de la cotización. Escalar más de un "
+            "orden de magnitud con la Ec. 7.1 es poco confiable.",
+        ))
+    if not 0.3 <= exponent <= 0.9:
+        notes.append(Notice(
+            "warning",
+            f"n = {exponent:g} está fuera del intervalo típico de la Tabla 7.3 (0.30–0.84).",
+        ))
+    notes.append(Notice(
+        "info",
+        "Costo escalado desde tu cotización (Ec. 7.1) y llevado a CEPCI = 397. "
+        "Sin desglose de material ni presión, C°_BM se toma igual a C_BM.",
+    ))
+    CBM_unit = Cp0 * fbm
+    return CostResult(
+        equipment=eq, capacity=capacity, units=units, material=eq.materials[0],
+        pressure=0.0, pressure_option=None, diameter=None, length=None, trays=1,
+        Cp0=Cp0, FM=1.0, FP=1.0, FBM=fbm, Fq=1.0,
+        CBM_unit=CBM_unit, CBM0_unit=CBM_unit, Cp_base_unit=Cp0, notices=notes,
     )
 
 

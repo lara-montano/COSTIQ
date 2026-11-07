@@ -121,13 +121,16 @@ class Equipment:
     unit: str
     a_min: float
     a_max: float
-    method: str  # "B1B2", "vessel", "FBM", "FBM_FP", "tray"
+    method: str  # "B1B2", "vessel", "FBM", "FBM_FP", "tray", "quote"
     materials: tuple[Material, ...]
     B1: float | None = None
     B2: float | None = None
     pressure: tuple[PressureOption, ...] = ()
     pressure_label: str = "Presión de operación"
+    pressure_unit: str = "barg"
     geometry: str | None = None  # "horizontal" o "vertical" para recipientes
+    fbm_editable: bool = False   # F_BM no tabulado: el usuario puede cambiarlo
+    superheat: bool = False      # aplica F_T de sobrecalentamiento (calderas)
     note: str = ""
 
     @property
@@ -285,6 +288,32 @@ P_PUMP_OTHER = (
         PressureBand(10), PressureBand(100, -0.245382, 0.259016, -0.01363))),
 )
 P_TANK = (PressureOption("all", "Presión de operación", (PressureBand(0.07),)),)
+# Evaporadores: la Tabla A.2 imprime "P < 0" para el primer tramo, pero la
+# correlación da F_P = 1.000 en P = 10 barg; el tramo real es P < 10.
+P_EVAPORATOR = (
+    PressureOption("all", "Presión de operación", (
+        PressureBand(10), PressureBand(150, 0.1578, -0.2992, 0.1413))),
+)
+P_FAN_CENTRIFUGAL = (
+    PressureOption("all", "Aumento de presión", (
+        PressureBand(1), PressureBand(16, 0.0, 0.20899, -0.0328))),
+)
+P_FAN_AXIAL = (
+    PressureOption("all", "Aumento de presión", (
+        PressureBand(1), PressureBand(4, 0.0, 0.20899, -0.0328))),
+)
+P_THERMAL_FLUID = (
+    PressureOption("all", "Presión de operación", (
+        PressureBand(2), PressureBand(200, -0.01633, 0.056875, -0.00876))),
+)
+P_STEAM_BOILER = (
+    PressureOption("all", "Presión del vapor", (
+        PressureBand(20), PressureBand(40, 2.594072, -4.23476, 1.722404))),
+)
+P_VAPORIZER = (
+    PressureOption("all", "Presión de operación", (
+        PressureBand(5), PressureBand(320, -0.16742, 0.13428, 0.15058))),
+)
 
 
 def _furnace(C1, C2, C3):
@@ -304,12 +333,26 @@ PUMPS = "Bombas"
 COMPRESSORS = "Compresores y sopladores"
 DRIVES = "Accionamientos"
 TURBINES = "Turbinas de recuperación"
-FURNACES = "Hornos y calentadores"
+FURNACES = "Hornos de proceso"
 REACTORS = "Reactores"
 TANKS = "Tanques de almacenamiento"
+EVAPORATORS = "Evaporadores"
+DRYERS = "Secadores"
+HEATERS = "Calentadores y calderas"
+VAPORIZERS = "Vaporizadores y marmitas"
+MIXERS = "Mezcladores y agitadores"
+CRYSTALLIZERS = "Cristalizadores"
+CONVEYORS = "Transporte de sólidos"
+SCREENS = "Cribas"
+FILTERS = "Filtros"
+CENTRIFUGES = "Centrífugas"
+DUST = "Colectores de polvo"
+FANS = "Ventiladores"
 
 AREA, VOLUME = ("Área", "m²"), ("Volumen", "m³")
 SHAFT, FLUID, DUTY = ("Potencia de flecha", "kW"), ("Potencia de fluido", "kW"), ("Carga térmica", "kW")
+DIAMETER, POWER = ("Diámetro", "m"), ("Potencia", "kW")
+GAS_FLOW = ("Flujo de gas", "m³/s")
 
 _B_ST = dict(B1=1.63, B2=1.66)
 _B_DP = dict(B1=1.74, B2=1.55)
@@ -327,6 +370,53 @@ def _eq(key, category, name, name_en, K, attr, a_range, method, materials, **kw)
 
 
 _REACTOR_NOTE = "F_BM = 4.0 es una estimación del libro (Tabla A.7, marcada con *)."
+_ESTIMATE_NOTE = "El libro marca este F_BM como estimación (Tabla A.7, *)."
+_BOILER_NOTE = (
+    "La Tabla A.6 no da F_BM para calderas de vapor. COSTIQ supone 2.16, el del "
+    "calentador de fluido térmico (ID 56); ajústalo si tienes un dato mejor."
+)
+
+
+def _fbm_mats(rows):
+    """Materiales con F_BM de la Fig. A.19: (código, etiqueta, valor, ID)."""
+    return tuple(Material(c, lab, v, f"Tabla A.6, ID {i}") for c, lab, v, i in rows)
+
+
+FBM_EVAP_FORCED = _fbm_mats((
+    ("CS", "Acero al carbón", 2.90, 19), ("Cu alloy", "Aleación de cobre", 3.63, 20),
+    ("SS", "Acero inoxidable", 5.08, 21), ("Ni", "Aleación de níquel", 9.66, 22),
+    ("Ti", "Titanio", 14.51, 23),
+))
+FBM_EVAP_FILM = _fbm_mats((
+    ("CS", "Acero al carbón", 2.26, 24), ("Cu alloy", "Aleación de cobre", 2.81, 25),
+    ("SS", "Acero inoxidable", 3.94, 26), ("Ni", "Aleación de níquel", 7.50, 27),
+    ("Ti", "Titanio", 11.25, 28),
+))
+FBM_VAPORIZER_JACKET = _fbm_mats((
+    ("CS", "Acero al carbón", 2.73, 29), ("Cu", "Cobre", 3.43, 30),
+    ("Glass/SS", "Vidriado, serpentín SS", 4.66, 31),
+    ("Glass/Ni", "Vidriado, serpentín Ni", 4.93, 32),
+    ("SS", "Acero inoxidable", 4.80, 33), ("SS clad", "Recubierto de SS", 3.77, 34),
+    ("Ni", "Aleación de níquel", 9.12, 35), ("Ni clad", "Recubierto de Ni", 5.93, 36),
+    ("Ti", "Titanio", 13.71, 37), ("Ti clad", "Recubierto de Ti", 9.60, 38),
+))
+FBM_VAPORIZER_COIL = _fbm_mats((
+    ("CS", "Acero al carbón", 3.03, 39), ("Cu", "Cobre", 3.79, 40),
+    ("Glass/SS", "Vidriado, serpentín SS", 5.15, 41),
+    ("Glass/Ni", "Vidriado, serpentín Ni", 5.45, 42),
+    ("SS", "Acero inoxidable", 5.15, 43), ("SS clad", "Recubierto de SS", 4.09, 44),
+    ("Ni", "Aleación de níquel", 10.10, 45), ("Ni clad", "Recubierto de Ni", 6.56, 46),
+    ("Ti", "Titanio", 15.16, 47), ("Ti clad", "Recubierto de Ti", 10.62, 48),
+))
+FBM_FAN = _fbm_mats((
+    ("CS", "Acero al carbón", 2.74, 49), ("Fiberglass", "Fibra de vidrio", 4.97, 50),
+    ("SS", "Acero inoxidable", 5.75, 51), ("Ni", "Aleación de níquel", 11.45, 52),
+))
+
+
+def _a7(value: float, estimate: bool):
+    ref = "Tabla A.7" + (" (estimación)" if estimate else "")
+    return _fixed(value, ref)
 _TANK_NOTE = (
     "El Apéndice A no tabula F_BM para tanques API. COSTIQ usa 1.0 "
     "(solo costo de compra) como supuesto; ajústalo si tienes un dato mejor."
@@ -510,23 +600,202 @@ EQUIPMENT_LIST: tuple[Equipment, ...] = (
     _eq("tank_fixed_roof", TANKS, "API de techo fijo", "API fixed roof",
         (4.8509, -0.3973, 0.1445), VOLUME, (90, 30000), "FBM",
         _fixed(1.0, "Supuesto de COSTIQ (no tabulado)"), pressure=P_TANK,
-        note=_TANK_NOTE),
+        fbm_editable=True, note=_TANK_NOTE),
     _eq("tank_floating_roof", TANKS, "API de techo flotante", "API floating roof",
         (5.9567, -0.7585, 0.1749), VOLUME, (1000, 40000), "FBM",
         _fixed(1.0, "Supuesto de COSTIQ (no tabulado)"), pressure=P_TANK,
-        note=_TANK_NOTE),
+        fbm_editable=True, note=_TANK_NOTE),
+
+    # --- Evaporadores (Tablas A.1, A.2 y A.6) ----------------------------------
+    _eq("evap_forced", EVAPORATORS, "Circulación forzada", "Forced circulation (pumped)",
+        (5.0238, 0.3475, 0.0703), AREA, (5, 1000), "FBM_FP", FBM_EVAP_FORCED,
+        pressure=P_EVAPORATOR),
+    _eq("evap_falling_film", EVAPORATORS, "Película descendente", "Falling film",
+        (3.9119, 0.8627, -0.0088), AREA, (50, 500), "FBM_FP", FBM_EVAP_FILM,
+        pressure=P_EVAPORATOR),
+    _eq("evap_agitated_film", EVAPORATORS, "Película agitada (pared raspada)",
+        "Agitated film (scraped wall)", (5.0000, 0.1490, -0.0134), AREA, (0.5, 5),
+        "FBM_FP", FBM_EVAP_FILM, pressure=P_EVAPORATOR),
+    _eq("evap_short_tube", EVAPORATORS, "Tubo corto", "Short tube",
+        (5.2366, -0.6572, 0.3500), AREA, (10, 100), "FBM_FP", FBM_EVAP_FORCED,
+        pressure=P_EVAPORATOR),
+    _eq("evap_long_tube", EVAPORATORS, "Tubo largo", "Long tube",
+        (4.6420, 0.3698, 0.0025), AREA, (100, 10000), "FBM_FP", FBM_EVAP_FORCED,
+        pressure=P_EVAPORATOR),
+
+    # --- Secadores (Tablas A.1 y A.7) -------------------------------------------
+    _eq("dryer_drum", DRYERS, "De tambor", "Drum dryer",
+        (4.5472, 0.2731, 0.1340), AREA, (0.5, 50), "FBM", _a7(1.60, False)),
+    _eq("dryer_rotary", DRYERS, "Rotatorio de gas directo", "Rotary, gas fired",
+        (3.5645, 1.1118, -0.0777), AREA, (5, 100), "FBM", _a7(1.25, False)),
+    _eq("dryer_tray", DRYERS, "De charolas", "Tray dryer",
+        (3.6951, 0.5442, -0.1248), AREA, (1.8, 20), "FBM", _a7(1.25, False)),
+
+    # --- Calentadores de fluido térmico y calderas (Tablas A.1, A.2, A.5, A.6) --
+    *(
+        _eq(key, HEATERS, name, name_en, K, DUTY, (650, 10750), "FBM_FP",
+            _fixed(2.16, "Tabla A.6, ID 56"), pressure=P_THERMAL_FLUID)
+        for key, name, name_en, K in (
+            ("heater_diphenyl", "Calentador de aceite de difenilo", "Diphenyl heater",
+             (2.2628, 0.8581, 0.0003)),
+            ("heater_molten_salt", "Calentador de sales fundidas", "Molten salt heater",
+             (1.1979, 1.4782, -0.0958)),
+            ("heater_hot_water", "Calentador de agua caliente", "Hot water heater",
+             (2.0829, 0.9074, -0.0243)),
+        )
+    ),
+    _eq("steam_boiler", HEATERS, "Caldera de vapor (paquete)", "Steam boiler",
+        (6.9617, -1.4800, 0.3161), DUTY, (1200, 9400), "FBM_FP",
+        _fixed(2.16, "Supuesto de COSTIQ (no tabulado)"), pressure=P_STEAM_BOILER,
+        pressure_label="Presión del vapor", fbm_editable=True, superheat=True,
+        note=_BOILER_NOTE),
+
+    # --- Vaporizadores y marmitas enchaquetadas ---------------------------------
+    _eq("vaporizer_jacketed", VAPORIZERS, "Recipiente enchaquetado (marmita)",
+        "Jacketed vessel", (3.8751, 0.3328, 0.1901), VOLUME, (1, 100), "FBM_FP",
+        FBM_VAPORIZER_JACKET, pressure=P_VAPORIZER),
+    _eq("vaporizer_coil", VAPORIZERS, "Enchaquetado con serpentín interno",
+        "Internal coils/jackets", (4.0000, 0.4321, 0.1700), VOLUME, (1, 100), "FBM_FP",
+        FBM_VAPORIZER_COIL, pressure=P_VAPORIZER),
+
+    # --- Mezcladores y agitadores (Tablas A.1 y A.7) ------------------------------
+    _eq("blender_kneader", MIXERS, "Amasadora", "Kneader blender",
+        (5.0141, 0.5867, 0.3224), VOLUME, (0.14, 3), "FBM", _a7(1.12, True),
+        note=_ESTIMATE_NOTE),
+    _eq("blender_ribbon", MIXERS, "Mezclador de listones", "Ribbon blender",
+        (4.1366, 0.5072, 0.0070), VOLUME, (0.7, 11), "FBM", _a7(1.12, True),
+        note=_ESTIMATE_NOTE),
+    _eq("blender_rotary", MIXERS, "Mezclador rotatorio", "Rotary blender",
+        (4.1366, 0.5072, 0.0070), VOLUME, (0.7, 11), "FBM", _a7(1.12, False)),
+    _eq("mixer_impeller", MIXERS, "Agitador de impulsor", "Impeller mixer",
+        (3.8511, 0.7009, -0.0003), POWER, (5, 150), "FBM", _a7(1.38, True),
+        note=_ESTIMATE_NOTE),
+    _eq("mixer_propeller", MIXERS, "Agitador de hélice", "Propeller mixer",
+        (4.3207, 0.0359, 0.1346), POWER, (5, 500), "FBM", _a7(1.38, False)),
+    _eq("mixer_turbine", MIXERS, "Agitador de turbina", "Turbine mixer",
+        (3.4092, 0.4896, 0.0030), POWER, (5, 150), "FBM", _a7(1.38, False)),
+
+    # --- Cristalizadores -------------------------------------------------------------
+    _eq("crystallizer_batch", CRYSTALLIZERS, "Cristalizador por lotes", "Batch crystallizer",
+        (4.5097, 0.1731, 0.1344), VOLUME, (1.5, 30), "FBM", _a7(1.60, False)),
+
+    # --- Transporte de sólidos ------------------------------------------------------
+    _eq("conveyor_apron", CONVEYORS, "Transportador de placas (apron)", "Apron conveyor",
+        (3.9255, 0.5039, 0.1506), AREA, (1.0, 15), "FBM", _a7(1.20, False)),
+    _eq("conveyor_belt", CONVEYORS, "Banda transportadora", "Belt conveyor",
+        (4.0637, 0.2584, 0.1550), AREA, (0.5, 325), "FBM", _a7(1.25, False)),
+    _eq("conveyor_pneumatic", CONVEYORS, "Transporte neumático", "Pneumatic conveyor",
+        (4.6616, 0.3205, 0.0638), AREA, (0.75, 65), "FBM", _a7(1.25, True),
+        note=_ESTIMATE_NOTE),
+    _eq("conveyor_screw", CONVEYORS, "Transportador de tornillo", "Screw conveyor",
+        (3.6062, 0.2659, 0.1982), AREA, (0.5, 30), "FBM", _a7(1.10, False)),
+
+    # --- Cribas ---------------------------------------------------------------------------
+    _eq("screen_dsm", SCREENS, "Criba curva (DSM)", "DSM screen",
+        (3.8050, 0.5856, 0.2120), AREA, (0.3, 6), "FBM", _a7(1.34, True),
+        note=_ESTIMATE_NOTE),
+    _eq("screen_rotary", SCREENS, "Criba rotatoria", "Rotary screen",
+        (4.0485, 0.1118, 0.3260), AREA, (0.3, 15), "FBM", _a7(1.34, True),
+        note=_ESTIMATE_NOTE),
+    _eq("screen_stationary", SCREENS, "Criba estacionaria", "Stationary screen",
+        (3.8219, 1.0368, -0.6050), AREA, (2, 11), "FBM", _a7(1.34, True),
+        note=_ESTIMATE_NOTE),
+    _eq("screen_vibrating", SCREENS, "Criba vibratoria", "Vibrating screen",
+        (4.0485, 0.1118, 0.3260), AREA, (0.3, 15), "FBM", _a7(1.34, False)),
+
+    # --- Filtros ---------------------------------------------------------------------------
+    *(
+        _eq(key, FILTERS, name, name_en, K, AREA, rng, "FBM", _a7(fbm, est),
+            note=_ESTIMATE_NOTE if est else "")
+        for key, name, name_en, K, rng, fbm, est in (
+            ("filter_bent", "Filtro «bent» (así en Turton)", "Bent",
+             (5.1055, 0.4999, 0.0001), (0.9, 115), 1.65, True),
+            ("filter_cartridge", "De cartucho", "Cartridge",
+             (3.2107, 0.7597, 0.0027), (15, 200), 1.65, True),
+            ("filter_disc_drum", "De disco y de tambor", "Disc and drum",
+             (4.8123, 0.2858, 0.0420), (0.9, 300), 1.65, True),
+            ("filter_gravity", "Por gravedad", "Gravity",
+             (4.2756, 0.3520, 0.0714), (0.5, 80), 1.65, True),
+            ("filter_leaf", "De hojas", "Leaf",
+             (3.8187, 0.6235, 0.0176), (0.6, 235), 1.65, False),
+            ("filter_pan", "De charola (pan)", "Pan",
+             (4.8123, 0.2858, 0.0420), (0.9, 300), 1.65, True),
+            ("filter_plate_frame", "Filtro prensa de placas y marcos", "Plate and frame",
+             (4.2756, 0.3520, 0.0714), (0.5, 80), 1.80, False),
+            ("filter_table", "De mesa", "Table",
+             (5.1055, 0.4999, 0.0001), (0.9, 115), 1.65, True),
+            ("filter_tube", "Tubular", "Tube",
+             (5.1055, 0.4999, 0.0001), (0.9, 115), 1.65, True),
+        )
+    ),
+
+    # --- Centrífugas -----------------------------------------------------------------------
+    _eq("centrifuge_auto_batch", CENTRIFUGES, "Separador automático por lotes",
+        "Auto batch separator", (4.7681, 0.9740, 0.0240), DIAMETER, (0.5, 1.7), "FBM",
+        _a7(1.57, True), note=_ESTIMATE_NOTE),
+    _eq("centrifuge_separator", CENTRIFUGES, "Separador centrífugo", "Centrifugal separator",
+        (4.3612, 0.8764, -0.0049), DIAMETER, (0.5, 1.0), "FBM", _a7(1.57, False)),
+    _eq("centrifuge_oscillating", CENTRIFUGES, "Criba oscilante", "Oscillating screen",
+        (4.8600, 0.3340, 0.1063), DIAMETER, (0.5, 1.1), "FBM", _a7(1.57, True),
+        note=_ESTIMATE_NOTE),
+    _eq("centrifuge_solid_bowl", CENTRIFUGES, "De tazón sólido (sin motor)",
+        "Solid bowl w/o motor", (4.9697, 1.1689, 0.0038), DIAMETER, (0.3, 2.0), "FBM",
+        _a7(1.27, False)),
+
+    # --- Colectores de polvo -----------------------------------------------------------------
+    *(
+        _eq(key, DUST, name, name_en, K, VOLUME, rng, "FBM", _a7(2.86, True),
+            note=_ESTIMATE_NOTE)
+        for key, name, name_en, K, rng in (
+            ("dust_baghouse", "Filtro de mangas", "Baghouse",
+             (4.5007, 0.4182, 0.0813), (0.08, 350)),
+            ("dust_cyclone", "Lavador ciclónico", "Cyclone scrubber",
+             (3.6298, 0.5009, 0.0411), (0.06, 200)),
+            ("dust_esp", "Precipitador electrostático", "Electrostatic precipitator",
+             (3.6298, 0.5009, 0.0411), (0.06, 200)),
+            ("dust_venturi", "Lavador Venturi", "Venturi scrubber",
+             (3.6298, 0.5009, 0.0411), (0.06, 200)),
+        )
+    ),
+
+    # --- Ventiladores con motor eléctrico ---------------------------------------------------
+    _eq("fan_radial", FANS, "Centrífugo radial", "Centrifugal radial fan",
+        (3.5391, -0.3533, 0.4477), GAS_FLOW, (1, 100), "FBM_FP", FBM_FAN,
+        pressure=P_FAN_CENTRIFUGAL, pressure_label="Aumento de presión ΔP",
+        pressure_unit="kPa"),
+    _eq("fan_backward", FANS, "Centrífugo de álabes hacia atrás", "Backward curve fan",
+        (3.3471, -0.0734, 0.3090), GAS_FLOW, (1, 100), "FBM_FP", FBM_FAN,
+        pressure=P_FAN_CENTRIFUGAL, pressure_label="Aumento de presión ΔP",
+        pressure_unit="kPa"),
+    _eq("fan_axial_vane", FANS, "Axial de paletas", "Axial vane fan",
+        (3.1761, -0.1373, 0.3414), GAS_FLOW, (1, 100), "FBM_FP", FBM_FAN,
+        pressure=P_FAN_AXIAL, pressure_label="Aumento de presión ΔP", pressure_unit="kPa"),
+    _eq("fan_axial_tube", FANS, "Axial tubular", "Axial tube fan",
+        (3.0414, -0.3375, 0.4722), GAS_FLOW, (1, 100), "FBM_FP", FBM_FAN,
+        pressure=P_FAN_AXIAL, pressure_label="Aumento de presión ΔP", pressure_unit="kPa"),
 )
 
 EQUIPMENT: dict[str, Equipment] = {e.key: e for e in EQUIPMENT_LIST}
 
-CATEGORIES: dict[str, list[Equipment]] = {}
+# Orden de presentación: térmicos, recipientes y reacción, sólidos, fluidos.
+CATEGORY_ORDER: tuple[str, ...] = (
+    HX, EVAPORATORS, DRYERS, HEATERS, VAPORIZERS, FURNACES,
+    VESSELS, TOWERS, INTERNALS, REACTORS, MIXERS, CRYSTALLIZERS, TANKS,
+    CONVEYORS, SCREENS, FILTERS, CENTRIFUGES, DUST,
+    PUMPS, COMPRESSORS, FANS, DRIVES, TURBINES,
+)
+
+CATEGORIES: dict[str, list[Equipment]] = {c: [] for c in CATEGORY_ORDER}
 for _e in EQUIPMENT_LIST:
-    CATEGORIES.setdefault(_e.category, []).append(_e)
+    CATEGORIES[_e.category].append(_e)
 
 TAG_PREFIX: dict[str, str] = {
     HX: "E", VESSELS: "V", TOWERS: "T", INTERNALS: "T", PUMPS: "P",
     COMPRESSORS: "C", DRIVES: "D", TURBINES: "X", FURNACES: "H",
-    REACTORS: "R", TANKS: "TK",
+    REACTORS: "R", TANKS: "TK", EVAPORATORS: "EV", DRYERS: "SC",
+    HEATERS: "B", VAPORIZERS: "VP", MIXERS: "M", CRYSTALLIZERS: "CR",
+    CONVEYORS: "TR", SCREENS: "CB", FILTERS: "F", CENTRIFUGES: "CF",
+    DUST: "CP", FANS: "VT",
 }
 
 METHOD_EQUATION: dict[str, str] = {
@@ -535,6 +804,7 @@ METHOD_EQUATION: dict[str, str] = {
     "FBM": r"C_{BM} = C_p^\circ\,F_{BM}",
     "FBM_FP": r"C_{BM} = C_p^\circ\,F_{BM}\,F_P",
     "tray": r"C_{BM} = C_p^\circ\,N\,F_{BM}\,F_q",
+    "quote": r"C_{BM} = C_{ref}\left(\frac{S}{S_{ref}}\right)^{n}\frac{397}{CEPCI_{ref}}\,F_{BM}",
 }
 
 METHOD_SOURCE: dict[str, str] = {
@@ -543,4 +813,5 @@ METHOD_SOURCE: dict[str, str] = {
     "FBM": "Tablas A.5–A.7, Fig. A.19",
     "FBM_FP": "Tablas A.2, A.5 y A.6, Fig. A.19",
     "tray": "Tablas A.5 y A.6, Fig. A.19",
+    "quote": "Ec. 7.1 (escalamiento) y Ec. 7.4 (CEPCI)",
 }
