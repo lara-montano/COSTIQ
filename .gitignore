@@ -1,8 +1,10 @@
 __pycache__/
 *.pyc
-.streamlit/
+.pytest_cache/
+.streamlit/secrets.toml
 .env
 *.egg-info/
 dist/
 build/
 .DS_Store
+.claude/

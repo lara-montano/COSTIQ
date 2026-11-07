@@ -1,74 +1,79 @@
-# COSTIQ: An Open-Source Tool for Equipment Cost Estimation in Chemical Process Design
+# COSTIQ
 
-**COSTIQ** (*Costos en Ingenieria Quimica*) is a free, open-source, web-based tool for estimating purchase and installation costs of chemical process equipment, based on the methodology of Turton et al. (2018).
+**COSTIQ** (*Costos en Ingeniería Química*) estima el costo de equipo de proceso con el método de módulo de Turton et al. (2018), Apéndice A. Incluye un paquete de Python importable (`costiq`) y una interfaz web en Streamlit.
 
-## Features
+## Qué calcula
 
-- **36 equipment types** across 10 categories (heat exchangers, towers, trays, reactors, pressure vessels, tanks, pumps, compressors, fired heaters, turbines)
-- **5 costing methods:** B1B2, vessel (ASME), FBM, FBM-FP, tray
-- **Pressure factors** via ASME vessel correlation (Eq. A.2) and tabulated correlations (Eq. A.3)
-- **Material-of-construction factors** for each equipment type
-- **CEPCI temporal updating** with 24 annual values (2001--2024)
-- **Multi-equipment plant inventory** with grassroots cost estimation
-- **Sensitivity analysis:** size, pressure, and material comparison
-- **USD/MXN currency conversion** with configurable exchange rate
-- **CSV export** of the complete plant inventory
+- Costo de compra C_p° de 96 tipos de equipo en 23 categorías (Tabla A.1), incluidos evaporadores, secadores, filtros, centrífugas, cribas, transportadores, mezcladores, calderas y marmitas.
+- Factores de presión por la Ec. A.2 (recipientes y torres) y la Ec. A.3 con la Tabla A.2.
+- Factores de material (Fig. A.18) y de módulo desnudo (Fig. A.19, Tabla A.7), con el identificador del libro de cada valor.
+- Costo de módulo desnudo C_BM (Ec. A.4 y Tabla A.5), torres con platos o empaque, y unidades en paralelo.
+- Cotización propia: cualquier equipo sin correlación (molinos, extrusores, membranas…) se escala desde un precio de referencia con la Ec. 7.1.
+- Costo de módulo total C_TM y costo grassroots C_GR (Ecs. 7.15 y 7.16).
+- Actualización con el CEPCI anual (2001–2024) o con un valor propio; conversión a MXN.
+- Sensibilidad a capacidad, presión, material y año; cascada de costos; proyecto guardable en JSON y exportable a CSV.
 
-## Installation
+## Instalación y uso
 
 ```bash
-# Clone the repository
 git clone https://github.com/lara-montano/COSTIQ.git
 cd COSTIQ
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Run the application
 streamlit run app.py
 ```
 
-## Requirements
+Desde Python, sin interfaz:
 
-- Python 3.9 or higher
-- Streamlit >= 1.30
-- Plotly >= 5.18
-- Pandas >= 2.0
+```python
+from costiq import cost, plant_summary
 
-## Usage
-
-Once running, COSTIQ opens in your web browser. Use the sidebar to:
-
-1. Select equipment category and type
-2. Enter capacity, material, and operating pressure
-3. View the complete cost breakdown with equations and intermediate values
-4. Add equipment to the plant inventory
-5. Explore sensitivity analyses and cost evolution over time
-
-## Methodology
-
-All correlations and factors are from:
-
-> Turton, R., Shaeiwitz, J. A., Bhattacharyya, D., & Whiting, W. B. (2018). *Analysis, Synthesis, and Design of Chemical Processes* (5th ed.). Prentice Hall. Appendix A.
-
-Base CEPCI = 397 (September 2001).
-
-## Citation
-
-If you use COSTIQ in your research, please cite:
-
-```
-Lara-Montano, O. D., Gomez-Castro, F. I., & Martinez-Guido, S. I. (2026).
-COSTIQ: An Open-Source Tool for Equipment Cost Estimation in Chemical Process Design.
-SoftwareX. [Submitted]
+e102 = cost("hx_floating_head", 205, material="CS/SS", pressure=18, pressure_option="both")
+t101 = cost("tower", material="CS", pressure=5, diameter=2.1, length=23)
+print(e102.FBM, t101.FP)            # 4.82, 1.68
+s = plant_summary([e102, t101], cepci=800.8)
+print(s.CTM, s.CGR)
 ```
 
-## License
+## Validación
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+```bash
+pip install pytest
+python -m pytest
+```
 
-## Authors
+Las pruebas reproducen los Ejemplos 7.3, 7.5 y 7.10 a 7.14 del libro. En el Ejemplo 7.14 (siete equipos), COSTIQ obtiene ΣC_BM = 1,088,399 USD, C_TM = 1,284,311 USD y C_GR = 1,692,466 USD con CEPCI = 542; el libro reporta 1,088,100, 1,284,000 y 1,692,000 USD.
 
-- **Oscar Daniel Lara-Montano** -- Universidad Autonoma de Queretaro (oscar.lara@uaq.mx)
-- **Fernando Israel Gomez-Castro** -- Universidad de Guanajuato
-- **Sergio Ivan Martinez-Guido** -- Universidad de Guanajuato
+## Supuestos que conviene conocer
+
+- **Ec. A.2 con (P + 1).** La Ec. A.2 impresa en la 5.ª edición usa P; los Ejemplos 7.13 y 7.14 usan (P + 1). COSTIQ sigue los ejemplos (`costiq.engine.VESSEL_GAUGE_OFFSET`).
+- **Factores leídos de figuras.** F_M y F_BM se digitalizaron de las Figuras A.18 y A.19, con resolución de ±0.03 a ±0.04.
+- **Tanques API.** El Apéndice A no tabula F_BM para tanques; COSTIQ usa 1.0 y permite cambiarlo.
+- **CEPCI.** Los promedios anuales 2002–2024 aún no se verifican contra la fuente primaria.
+- **Equipos de la v2.1.** Varios F_BM de la Tabla A.7 son estimaciones del libro; el F_BM de calderas de vapor es un supuesto (2.16). Detalle en [docs/COBERTURA_AGROINDUSTRIA.md](docs/COBERTURA_AGROINDUSTRIA.md).
+
+La auditoría completa de la versión 1 y la justificación de cada cambio están en [docs/AUDITORIA_v1.md](docs/AUDITORIA_v1.md).
+
+## Estructura
+
+```
+costiq/        paquete de cálculo (sin dependencias)
+  data.py      constantes del Apéndice A con su fuente
+  engine.py    ecuaciones y costo de planta
+ui/            estilos y gráficas de la interfaz
+app.py         interfaz Streamlit
+tests/         pruebas contra los ejemplos del libro
+```
+
+## Referencia
+
+Turton, R., Shaeiwitz, J. A., Bhattacharyya, D., & Whiting, W. B. (2018). *Analysis, Synthesis, and Design of Chemical Processes* (5th ed.). Pearson. Appendix A.
+
+## Autores
+
+- Oscar Daniel Lara-Montaño, Universidad Autónoma de Querétaro
+- Fernando Israel Gómez-Castro, Universidad de Guanajuato
+- Sergio Iván Martínez-Guido, Universidad de Guanajuato
+
+## Licencia
+
+MIT. Ver [LICENSE](LICENSE).
