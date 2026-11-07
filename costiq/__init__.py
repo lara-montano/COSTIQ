@@ -11,17 +11,18 @@ Uso mínimo::
 
 from .data import CATEGORIES, CEPCI, CEPCI_BASE, EQUIPMENT, EQUIPMENT_LIST
 from .engine import (
-    CostError, CostResult, Notice, PlantSummary, cost, plant_summary,
-    pressure_factor, purchased_cost, tray_area, tray_quantity_factor,
-    vessel_pressure_factor, vessel_volume,
+    QUOTE_KEY, CostError, CostResult, Notice, PlantSummary, cost, plant_summary,
+    pressure_factor, purchased_cost, quoted_cost, superheat_factor, tray_area,
+    tray_quantity_factor, vessel_pressure_factor, vessel_volume,
 )
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 __all__ = [
     "CATEGORIES", "CEPCI", "CEPCI_BASE", "EQUIPMENT", "EQUIPMENT_LIST",
-    "CostError", "CostResult", "Notice", "PlantSummary", "cost",
-    "plant_summary", "pressure_factor", "purchased_cost", "tray_area",
-    "tray_quantity_factor", "vessel_pressure_factor", "vessel_volume",
+    "QUOTE_KEY", "CostError", "CostResult", "Notice", "PlantSummary", "cost",
+    "plant_summary", "pressure_factor", "purchased_cost", "quoted_cost",
+    "superheat_factor", "tray_area", "tray_quantity_factor",
+    "vessel_pressure_factor", "vessel_volume",
     "__version__",
 ]

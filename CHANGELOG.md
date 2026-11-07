@@ -1,5 +1,21 @@
 # Registro de cambios
 
+## 2.1.0 — 2026-11-07
+
+### Nuevo
+
+- 50 tipos de equipo más del Apéndice A (96 en total, 23 categorías): evaporadores (5), secadores (3), calentadores de fluido térmico y calderas (4), marmitas y vaporizadores enchaquetados (2), mezcladores y agitadores (6), cristalizador (1), transportadores de sólidos (4), cribas (4), filtros (9), centrífugas (4), colectores de polvo (4) y ventiladores (4).
+- Cotización propia: escala un precio de referencia con la Ec. 7.1 y el CEPCI, con exponente y F_BM del usuario.
+- Factor de sobrecalentamiento F_T para calderas de vapor (Tabla A.5).
+- Presión de ventiladores como ΔP en kPa.
+- Mapa de cobertura del temario de Operaciones Unitarias I y II en `docs/COBERTURA_AGROINDUSTRIA.md`.
+- 314 pruebas (150 más), incluidos los Ejemplos 7.3 y 7.5.
+
+### Supuestos declarados
+
+- F_BM de calderas de vapor = 2.16 (no tabulado; editable).
+- Primer tramo de presión de evaporadores P < 10 barg (el libro imprime "P < 0").
+
 ## 2.0.0 — 2026-11-07
 
 ### Correcciones de cálculo

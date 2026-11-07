@@ -4,10 +4,11 @@
 
 ## Qué calcula
 
-- Costo de compra C_p° de 46 tipos de equipo en 11 categorías (Tabla A.1).
+- Costo de compra C_p° de 96 tipos de equipo en 23 categorías (Tabla A.1), incluidos evaporadores, secadores, filtros, centrífugas, cribas, transportadores, mezcladores, calderas y marmitas.
 - Factores de presión por la Ec. A.2 (recipientes y torres) y la Ec. A.3 con la Tabla A.2.
 - Factores de material (Fig. A.18) y de módulo desnudo (Fig. A.19, Tabla A.7), con el identificador del libro de cada valor.
 - Costo de módulo desnudo C_BM (Ec. A.4 y Tabla A.5), torres con platos o empaque, y unidades en paralelo.
+- Cotización propia: cualquier equipo sin correlación (molinos, extrusores, membranas…) se escala desde un precio de referencia con la Ec. 7.1.
 - Costo de módulo total C_TM y costo grassroots C_GR (Ecs. 7.15 y 7.16).
 - Actualización con el CEPCI anual (2001–2024) o con un valor propio; conversión a MXN.
 - Sensibilidad a capacidad, presión, material y año; cascada de costos; proyecto guardable en JSON y exportable a CSV.
@@ -40,7 +41,7 @@ pip install pytest
 python -m pytest
 ```
 
-Las pruebas reproducen los Ejemplos 7.10 a 7.14 del libro. En el Ejemplo 7.14 (siete equipos), COSTIQ obtiene ΣC_BM = 1,088,399 USD, C_TM = 1,284,311 USD y C_GR = 1,692,466 USD con CEPCI = 542; el libro reporta 1,088,100, 1,284,000 y 1,692,000 USD.
+Las pruebas reproducen los Ejemplos 7.3, 7.5 y 7.10 a 7.14 del libro. En el Ejemplo 7.14 (siete equipos), COSTIQ obtiene ΣC_BM = 1,088,399 USD, C_TM = 1,284,311 USD y C_GR = 1,692,466 USD con CEPCI = 542; el libro reporta 1,088,100, 1,284,000 y 1,692,000 USD.
 
 ## Supuestos que conviene conocer
 
@@ -48,6 +49,7 @@ Las pruebas reproducen los Ejemplos 7.10 a 7.14 del libro. En el Ejemplo 7.14 (s
 - **Factores leídos de figuras.** F_M y F_BM se digitalizaron de las Figuras A.18 y A.19, con resolución de ±0.03 a ±0.04.
 - **Tanques API.** El Apéndice A no tabula F_BM para tanques; COSTIQ usa 1.0 y permite cambiarlo.
 - **CEPCI.** Los promedios anuales 2002–2024 aún no se verifican contra la fuente primaria.
+- **Equipos de la v2.1.** Varios F_BM de la Tabla A.7 son estimaciones del libro; el F_BM de calderas de vapor es un supuesto (2.16). Detalle en [docs/COBERTURA_AGROINDUSTRIA.md](docs/COBERTURA_AGROINDUSTRIA.md).
 
 La auditoría completa de la versión 1 y la justificación de cada cambio están en [docs/AUDITORIA_v1.md](docs/AUDITORIA_v1.md).
 

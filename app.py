@@ -20,8 +20,8 @@ from costiq.data import (
     VESSEL_CA_M, VESSEL_E, VESSEL_S_BAR, VESSEL_TMIN_M,
 )
 from costiq.engine import (
-    VESSEL_GAUGE_OFFSET, CostError, CostResult, cost, plant_summary, tray_area,
-    vessel_volume,
+    QUOTE_CATEGORY, QUOTE_KEY, VESSEL_GAUGE_OFFSET, CostError, CostResult, cost,
+    plant_summary, quoted_cost, superheat_factor, tray_area, vessel_volume,
 )
 from ui import charts, theme
 
@@ -39,7 +39,9 @@ ss.setdefault("next_id", 1)
 ss.setdefault("last_upload", None)
 
 ENGINE_KEYS = ("equipment", "capacity", "material", "pressure", "pressure_option",
-               "diameter", "length", "trays", "units", "fbm_override")
+               "diameter", "length", "trays", "units", "fbm_override", "superheat")
+QUOTE_KEYS = ("name", "capacity", "unit", "ref_cost", "ref_capacity", "ref_cepci",
+              "exponent", "fbm", "units")
 
 EXAMPLE_714 = [
     dict(tag="E-101", equipment="hx_floating_head", capacity=170, material="CS/CS",
@@ -60,7 +62,15 @@ EXAMPLE_714 = [
 
 
 def run(spec: dict) -> CostResult:
+    if spec.get("equipment") == QUOTE_KEY:
+        return quoted_cost(**{k: spec[k] for k in QUOTE_KEYS if spec.get(k) is not None})
     return cost(**{k: spec[k] for k in ENGINE_KEYS if spec.get(k) is not None})
+
+
+def pressure_text(spec: dict, r: CostResult) -> str:
+    if not r.equipment.has_pressure:
+        return "—"
+    return f"{spec.get('pressure', 0.0):g} {r.equipment.pressure_unit}"
 
 
 def next_tag(prefix: str, extra: list[str] = ()) -> str:
@@ -170,136 +180,206 @@ with tab_eq:
     with col_in:
         with st.container(border=True):
             theme.eyebrow("Equipo")
-            category = st.selectbox("Categoría", list(CATEGORIES), key="in_category")
-            eq_key = st.selectbox(
-                "Tipo", [e.key for e in CATEGORIES[category]],
-                format_func=lambda k: EQUIPMENT[k].name, key=f"in_type_{category}",
-                help="Nombre original en Turton: se muestra al pie del formulario.",
-            )
-            eq = EQUIPMENT[eq_key]
-            k = eq.key
-
-            theme.eyebrow("Tamaño")
-            diameter = length = capacity = None
-            if eq.method == "vessel":
+            category = st.selectbox("Categoría", list(CATEGORIES) + [QUOTE_CATEGORY],
+                                    key="in_category",
+                                    help="«Cotización propia» costea cualquier equipo a "
+                                         "partir de un precio de referencia.")
+            if category == QUOTE_CATEGORY:
+                k = QUOTE_KEY
+                theme.eyebrow("Equipo a costear")
+                q_name = st.text_input("Nombre del equipo", value="Molino de martillos",
+                                       key="q_name")
                 c1, c2 = st.columns(2)
-                diameter = c1.number_input("Diámetro D (m)", min_value=0.1, max_value=20.0,
-                                           value=2.0 if k == "tower" else 1.5, step=0.1,
-                                           format="%.2f", key=f"D_{k}")
-                length = c2.number_input(
-                    "Longitud L (m)" if eq.geometry == "horizontal" else "Altura H (m)",
-                    min_value=0.1, max_value=200.0,
-                    value=20.0 if k == "tower" else 5.0, step=0.5, format="%.2f",
-                    key=f"L_{k}")
-                vol = vessel_volume(diameter, length)
-                inside = eq.a_min <= vol <= eq.a_max
-                st.caption(f"Volumen πD²L/4 = **{theme.num(vol)} m³** · rango de la "
-                           f"correlación {eq.a_min:g}–{eq.a_max:g} m³"
-                           + ("" if inside else " · **fuera de rango**"))
-            else:
-                cap_default = theme.nice_default(eq.a_min, eq.a_max)
-                capacity = st.number_input(
-                    f"{eq.attribute} ({eq.unit})", min_value=1e-4, max_value=1e7,
-                    value=cap_default,
-                    step=float(10 ** (math.floor(math.log10(cap_default)) - 1)),
-                    format="%.4g", key=f"cap_{k}",
-                    help="Por unidad. Puedes salir del rango; COSTIQ lo marca como extrapolación.")
-                st.caption(f"Rango de la correlación: {eq.a_min:g}–{eq.a_max:,g} {eq.unit} "
-                           "(Tabla A.1)")
-            units = st.number_input("Unidades idénticas", min_value=1, max_value=50, value=1,
-                                    step=1, key=f"units_{k}",
-                                    help="Equipos en paralelo o de respaldo, p. ej., P-101 A/B.")
-
-            theme.eyebrow("Material y operación")
-            mat_codes = [m.code for m in eq.materials]
-            fname = factor_name(eq.method)
-            material = st.selectbox(
-                "Material de construcción", mat_codes,
-                format_func=lambda c: f"{eq.material(c).label}  ·  {fname} {eq.material(c).factor:.2f}",
-                key=f"mat_{k}", disabled=len(mat_codes) == 1,
-            )
-
-            pressure, option = 0.0, None
-            if eq.has_pressure:
-                if len(eq.pressure) > 1:
-                    option = st.radio("Correlación de presión (Tabla A.2)",
-                                      [o.key for o in eq.pressure],
-                                      format_func=lambda o: eq.pressure_option(o).label,
-                                      key=f"popt_{k}", horizontal=True)
-                elif eq.pressure:
-                    option = eq.pressure[0].key
-                pressure = st.number_input(f"{eq.pressure_label} (barg)", min_value=-1.0,
-                                           max_value=2000.0, value=0.0, step=1.0,
-                                           format="%.2f", key=f"P_{k}")
-                if eq.method == "vessel":
-                    st.caption("F_P por la Ec. A.2 (ASME), válida para pared delgada.")
+                q_unit = c1.text_input("Unidad de tamaño", value="t/h", key="q_unit",
+                                       help="La que use tu cotización: t/h, kg/h, m², kW…")
+                capacity = c2.number_input("Tamaño por unidad", min_value=1e-4, max_value=1e9,
+                                           value=20.0, format="%.4g", key="q_cap")
+                units = st.number_input("Unidades idénticas", min_value=1, max_value=50,
+                                        value=1, step=1, key="units_custom")
+                theme.eyebrow("Cotización de referencia")
+                c1, c2 = st.columns(2)
+                q_cost = c1.number_input(
+                    "Precio de compra (USD)", min_value=1.0, max_value=1e10, value=50_000.0,
+                    step=1_000.0, format="%.0f", key="q_cost",
+                    help="En USD del año de la cotización. Si está en MXN, conviértela con "
+                         "el tipo de cambio de esa fecha.")
+                q_refcap = c2.number_input("Tamaño cotizado", min_value=1e-4, max_value=1e9,
+                                           value=10.0, format="%.4g", key="q_refcap")
+                q_year = st.selectbox(
+                    "CEPCI de la cotización", years + ["custom"],
+                    format_func=lambda y: "Otro valor…" if y == "custom"
+                    else f"{y}  ·  {CEPCI[y]:.1f}", key="q_year")
+                if q_year == "custom":
+                    q_cepci = st.number_input("CEPCI de la cotización", min_value=100.0,
+                                              max_value=5000.0, value=CEPCI[years[0]],
+                                              step=0.1, format="%.1f", key="q_cepci")
                 else:
-                    st.caption(f"Tabla A.2 válida hasta {eq.pressure_limit:g} barg.")
-            elif eq.category == TANKS:
-                st.caption("Tanque atmosférico (P < 0.07 barg). Sin corrección por presión.")
+                    q_cepci = CEPCI[q_year]
+                c1, c2 = st.columns(2)
+                q_n = c1.number_input(
+                    "Exponente n", min_value=0.05, max_value=1.5, value=0.6, step=0.01,
+                    format="%.2f", key="q_n",
+                    help="0.6 es la regla de los seis décimos (Ec. 7.1). La Tabla 7.3 "
+                         "del libro da de 0.30 a 0.84 según el equipo.")
+                q_fbm = c2.number_input(
+                    "F_BM", min_value=1.0, max_value=10.0, value=1.0, step=0.05,
+                    format="%.2f", key="q_fbm",
+                    help="1.0 = solo compra. En la Tabla A.7 los factores de instalación "
+                         "van de 1.10 a 2.86.")
+                st.caption("Para equipos sin correlación en el Apéndice A: molinos, "
+                           "extrusores, membranas, túneles de congelación…")
+                form = dict(equipment=QUOTE_KEY, name=q_name, capacity=capacity, unit=q_unit,
+                            ref_cost=q_cost, ref_capacity=q_refcap, ref_cepci=q_cepci,
+                            exponent=q_n, fbm=q_fbm, units=units)
+                eq = None
+                material, pressure, option, diameter, internals = "—", 0.0, None, None, None
+                fname = "F_BM"
             else:
-                st.caption("Este equipo no tiene corrección por presión en el libro.")
+                eq_key = st.selectbox(
+                    "Tipo", [e.key for e in CATEGORIES[category]],
+                    format_func=lambda k: EQUIPMENT[k].name, key=f"in_type_{category}",
+                    help="Nombre original en Turton: se muestra al pie del formulario.",
+                )
+                eq = EQUIPMENT[eq_key]
+                k = eq.key
 
-            trays = 1
-            if eq.method == "tray":
-                trays = st.number_input("Número de platos o eliminadores", min_value=1,
-                                        max_value=300, value=20, step=1, key=f"N_{k}",
-                                        help="F_q = 1 para N ≥ 20 (Tabla A.5).")
-
-            fbm_override = None
-            if eq.category == TANKS:
-                fbm_override = st.number_input("F_BM supuesto", min_value=1.0, max_value=10.0,
-                                               value=1.0, step=0.05, format="%.2f",
-                                               key=f"fbm_{k}", help=eq.note)
-
-            internals = None
-            if k == "tower":
-                theme.eyebrow("Internos de la torre")
-                kind = st.segmented_control("Internos", ["Ninguno", "Platos", "Empaque"],
-                                            default="Platos", key="tower_kind",
-                                            label_visibility="collapsed") or "Ninguno"
-                if kind == "Platos":
+                theme.eyebrow("Tamaño")
+                diameter = length = capacity = None
+                if eq.method == "vessel":
                     c1, c2 = st.columns(2)
-                    tray_key = c1.selectbox("Tipo de plato", ["tray_sieve", "tray_valve"],
-                                            format_func=lambda t: EQUIPMENT[t].name,
-                                            key="tower_tray_type")
-                    n_tr = c2.number_input("Platos", 1, 300, 30, 1, key="tower_n")
-                    t_eq = EQUIPMENT[tray_key]
-                    t_mat = st.selectbox(
-                        "Material de los platos", [m.code for m in t_eq.materials],
-                        format_func=lambda c: f"{t_eq.material(c).label}  ·  F_BM "
-                                              f"{t_eq.material(c).factor:.2f}",
-                        key="tower_tray_mat")
-                    internals = dict(equipment=tray_key, capacity=tray_area(diameter),
-                                     material=t_mat, trays=n_tr, units=units,
-                                     label="platos")
-                    st.caption(f"Área de plato πD²/4 = {theme.num(tray_area(diameter))} m²")
-                elif kind == "Empaque":
-                    c1, c2 = st.columns(2)
-                    h_pk = c1.number_input("Altura empacada (m)", 0.1, 200.0,
-                                           float(round(0.8 * length, 1)), 0.5,
-                                           key="tower_pack_h")
-                    p_eq = EQUIPMENT["packing"]
-                    p_mat = c2.selectbox(
-                        "Material", [m.code for m in p_eq.materials],
-                        format_func=lambda c: p_eq.material(c).label, key="tower_pack_mat")
-                    internals = dict(equipment="packing",
-                                     capacity=tray_area(diameter) * h_pk,
-                                     material=p_mat, units=units, label="empaque")
-                    st.caption(f"Volumen de empaque = {theme.num(tray_area(diameter) * h_pk)} m³")
+                    diameter = c1.number_input("Diámetro D (m)", min_value=0.1, max_value=20.0,
+                                               value=2.0 if k == "tower" else 1.5, step=0.1,
+                                               format="%.2f", key=f"D_{k}")
+                    length = c2.number_input(
+                        "Longitud L (m)" if eq.geometry == "horizontal" else "Altura H (m)",
+                        min_value=0.1, max_value=200.0,
+                        value=20.0 if k == "tower" else 5.0, step=0.5, format="%.2f",
+                        key=f"L_{k}")
+                    vol = vessel_volume(diameter, length)
+                    inside = eq.a_min <= vol <= eq.a_max
+                    st.caption(f"Volumen πD²L/4 = **{theme.num(vol)} m³** · rango de la "
+                               f"correlación {eq.a_min:g}–{eq.a_max:g} m³"
+                               + ("" if inside else " · **fuera de rango**"))
+                else:
+                    cap_default = theme.nice_default(eq.a_min, eq.a_max)
+                    capacity = st.number_input(
+                        f"{eq.attribute} ({eq.unit})", min_value=1e-4, max_value=1e7,
+                        value=cap_default,
+                        step=float(10 ** (math.floor(math.log10(cap_default)) - 1)),
+                        format="%.4g", key=f"cap_{k}",
+                        help="Por unidad. Puedes salir del rango; COSTIQ lo marca como extrapolación.")
+                    st.caption(f"Rango de la correlación: {eq.a_min:g}–{eq.a_max:,g} {eq.unit} "
+                               "(Tabla A.1)")
+                units = st.number_input("Unidades idénticas", min_value=1, max_value=50, value=1,
+                                        step=1, key=f"units_{k}",
+                                        help="Equipos en paralelo o de respaldo, p. ej., P-101 A/B.")
+
+                theme.eyebrow("Material y operación")
+                mat_codes = [m.code for m in eq.materials]
+                fname = factor_name(eq.method)
+                material = st.selectbox(
+                    "Material de construcción", mat_codes,
+                    format_func=lambda c: f"{eq.material(c).label}  ·  {fname} {eq.material(c).factor:.2f}",
+                    key=f"mat_{k}", disabled=len(mat_codes) == 1,
+                )
+
+                pressure, option = 0.0, None
+                if eq.has_pressure:
+                    if len(eq.pressure) > 1:
+                        option = st.radio("Correlación de presión (Tabla A.2)",
+                                          [o.key for o in eq.pressure],
+                                          format_func=lambda o: eq.pressure_option(o).label,
+                                          key=f"popt_{k}", horizontal=True)
+                    elif eq.pressure:
+                        option = eq.pressure[0].key
+                    pressure = st.number_input(f"{eq.pressure_label} ({eq.pressure_unit})",
+                                               min_value=-1.0, max_value=2000.0, value=0.0,
+                                               step=1.0, format="%.2f", key=f"P_{k}")
+                    if eq.method == "vessel":
+                        st.caption("F_P por la Ec. A.2 (ASME), válida para pared delgada.")
+                    else:
+                        st.caption(f"Tabla A.2 válida hasta {eq.pressure_limit:g} "
+                                   f"{eq.pressure_unit}.")
+                elif eq.category == TANKS:
+                    st.caption("Tanque atmosférico (P < 0.07 barg). Sin corrección por presión.")
+                else:
+                    st.caption("Este equipo no tiene corrección por presión en el libro.")
+
+                trays = 1
+                if eq.method == "tray":
+                    trays = st.number_input("Número de platos o eliminadores", min_value=1,
+                                            max_value=300, value=20, step=1, key=f"N_{k}",
+                                            help="F_q = 1 para N ≥ 20 (Tabla A.5).")
+
+                fbm_override = None
+                if eq.fbm_editable:
+                    fbm_override = st.number_input("F_BM supuesto", min_value=1.0, max_value=10.0,
+                                                   value=float(eq.base_material.factor),
+                                                   step=0.05, format="%.2f",
+                                                   key=f"fbm_{k}", help=eq.note)
+
+                superheat = 0.0
+                if eq.superheat:
+                    superheat = st.number_input(
+                        "Sobrecalentamiento ΔT (°C)", min_value=0.0, max_value=400.0, value=0.0,
+                        step=5.0, format="%.0f", key=f"dT_{k}",
+                        help="F_T = 1 + 0.00184 ΔT − 0.00000335 ΔT² (Tabla A.5). "
+                             "0 para vapor saturado.")
+
+                internals = None
+                if k == "tower":
+                    theme.eyebrow("Internos de la torre")
+                    kind = st.segmented_control("Internos", ["Ninguno", "Platos", "Empaque"],
+                                                default="Platos", key="tower_kind",
+                                                label_visibility="collapsed") or "Ninguno"
+                    if kind == "Platos":
+                        c1, c2 = st.columns(2)
+                        tray_key = c1.selectbox("Tipo de plato", ["tray_sieve", "tray_valve"],
+                                                format_func=lambda t: EQUIPMENT[t].name,
+                                                key="tower_tray_type")
+                        n_tr = c2.number_input("Platos", 1, 300, 30, 1, key="tower_n")
+                        t_eq = EQUIPMENT[tray_key]
+                        t_mat = st.selectbox(
+                            "Material de los platos", [m.code for m in t_eq.materials],
+                            format_func=lambda c: f"{t_eq.material(c).label}  ·  F_BM "
+                                                  f"{t_eq.material(c).factor:.2f}",
+                            key="tower_tray_mat")
+                        internals = dict(equipment=tray_key, capacity=tray_area(diameter),
+                                         material=t_mat, trays=n_tr, units=units,
+                                         label="platos")
+                        st.caption(f"Área de plato πD²/4 = {theme.num(tray_area(diameter))} m²")
+                    elif kind == "Empaque":
+                        c1, c2 = st.columns(2)
+                        h_pk = c1.number_input("Altura empacada (m)", 0.1, 200.0,
+                                               float(round(0.8 * length, 1)), 0.5,
+                                               key="tower_pack_h")
+                        p_eq = EQUIPMENT["packing"]
+                        p_mat = c2.selectbox(
+                            "Material", [m.code for m in p_eq.materials],
+                            format_func=lambda c: p_eq.material(c).label, key="tower_pack_mat")
+                        internals = dict(equipment="packing",
+                                         capacity=tray_area(diameter) * h_pk,
+                                         material=p_mat, units=units, label="empaque")
+                        st.caption(f"Volumen de empaque = {theme.num(tray_area(diameter) * h_pk)} m³")
+
+                form = dict(equipment=k, capacity=capacity, material=material,
+                            pressure=pressure, pressure_option=option, diameter=diameter,
+                            length=length, trays=trays, units=units,
+                            fbm_override=fbm_override, superheat=superheat)
 
             st.space("small")
-            prefix = TAG_PREFIX.get(eq.category, "X")
+            prefix = TAG_PREFIX.get(category, "EQ")
             tag = st.text_input("Etiqueta en el DFP", value=next_tag(prefix),
                                 key=f"tag_{k}_{ss.next_id}")
             add_clicked = st.button("Agregar a la planta", type="primary",
                                     icon=":material/add:", width="stretch")
-            st.caption(f"Turton: *{eq.name_en}* · {METHOD_SOURCE[eq.method]}")
+            if eq is not None:
+                st.caption(f"Turton: *{eq.name_en}* · {METHOD_SOURCE[eq.method]}")
+            else:
+                st.caption(METHOD_SOURCE["quote"])
 
     # --- Cálculo ------------------------------------------------------------
-    main_spec = dict(tag=tag, equipment=k, capacity=capacity, material=material,
-                     pressure=pressure, pressure_option=option, diameter=diameter,
-                     length=length, trays=trays, units=units, fbm_override=fbm_override)
+    main_spec = {"tag": tag, **form}
     specs = [main_spec]
     if internals:
         label = internals.pop("label")
@@ -321,21 +401,29 @@ with tab_eq:
     if results:
         with col_out:
             main = results[0]
+            eq = main.equipment
             total_now = sum(r.at(cepci) for r in results)
             internals_label = specs[1]["tag"].split(" · ")[-1] if len(specs) > 1 else None
             sub = [eq.name, f"{theme.num(main.capacity)} {eq.unit}",
                    main.material.label if len(eq.materials) > 1 else None,
-                   f"{pressure:g} barg" if eq.has_pressure else None,
+                   f"{pressure:g} {eq.pressure_unit}" if eq.has_pressure else None,
                    f"{units} unidades" if units > 1 else None,
                    f"con {internals_label}" if internals_label else None]
             factors = [("C<sub>p</sub>° compra, USD 2001", theme.money(main.Cp0))]
-            if eq.method in ("B1B2", "vessel"):
+            if eq.method == "quote":
+                factors = [("C<sub>p</sub> escalado, USD base 397", theme.money(main.Cp0)),
+                           ("S / S<sub>ref</sub>", f"{main.capacity / form['ref_capacity']:.3g}"),
+                           ("n exponente", f"{form['exponent']:.2f}"),
+                           ("F<sub>BM</sub> módulo", f"{main.FBM:.2f}")]
+            elif eq.method in ("B1B2", "vessel"):
                 factors += [("F<sub>M</sub> material", f"{main.FM:.2f}"),
                             ("F<sub>P</sub> presión", f"{main.FP:.3f}"),
                             ("F<sub>BM</sub> módulo", f"{main.FBM:.2f}")]
             elif eq.method == "FBM_FP":
                 factors += [("F<sub>BM</sub> módulo", f"{main.FBM:.2f}"),
                             ("F<sub>P</sub> presión", f"{main.FP:.3f}")]
+                if eq.superheat:
+                    factors.append(("F<sub>T</sub> sobrecalentamiento", f"{main.FT:.3f}"))
             elif eq.method == "tray":
                 factors += [("N platos", f"{main.trays}"), ("F<sub>q</sub> cantidad", f"{main.Fq:.3f}"),
                             ("F<sub>BM</sub> módulo", f"{main.FBM:.2f}")]
@@ -402,11 +490,10 @@ with tab_eq:
             view = st.segmented_control("Variable", options, default="Capacidad",
                                         key=f"sens_{k}", label_visibility="collapsed") or "Capacidad"
 
-            base_kw = {kk: main_spec[kk] for kk in ENGINE_KEYS if main_spec.get(kk) is not None}
             y_title = f"C<sub>BM</sub> ({currency})"
 
             def sweep_cost(**over):
-                return cost(**{**base_kw, **over})
+                return run({**main_spec, **over})
 
             if view == "Capacidad":
                 lo, hi = min(eq.a_min, main.capacity), max(eq.a_max, main.capacity)
@@ -433,7 +520,8 @@ with tab_eq:
                     valid = [p <= eq.pressure_option(option).p_max for p in ps]
                 fig = charts.sweep(ps, [r.at(cepci) * fx for r in rs], valid,
                                    (pressure, main.at(cepci) * fx),
-                                   x_title="Presión (barg)", y_title=y_title, log_x=False,
+                                   x_title=f"{eq.pressure_label} ({eq.pressure_unit})",
+                                   y_title=y_title, log_x=False,
                                    hover_extra=[f"<br>F_P = {r.FP:.3f}" for r in rs])
             elif view == "Material":
                 rs = [sweep_cost(material=m.code) for m in eq.materials]
@@ -449,62 +537,81 @@ with tab_eq:
 
             # Paso a paso
             with st.expander("Cálculo paso a paso", icon=":material/functions:"):
-                lA = math.log10(main.capacity)
-                st.markdown("**1. Costo de compra a condiciones base** (Ec. A.1, CEPCI = 397)")
-                st.latex(
-                    rf"\log_{{10}} C_p^\circ = {eq.K1} {eq.K2:+} \log_{{10}}({theme.num(main.capacity)})"
-                    rf" {eq.K3:+} [\log_{{10}}({theme.num(main.capacity)})]^2 = "
-                    rf"{eq.K1 + eq.K2 * lA + eq.K3 * lA * lA:.4f}".replace(",", "{,}")
-                )
-                st.latex(rf"C_p^\circ = \${main.Cp0:,.0f}".replace(",", "{,}"))
-
-                st.markdown("**2. Factor de presión**")
-                if eq.method == "vessel":
-                    if pressure < -0.5:
-                        st.latex(r"P < -0.5\ \text{barg} \Rightarrow F_P = 1.25")
-                    else:
-                        Pd = pressure + VESSEL_GAUGE_OFFSET
-                        st.latex(
-                            rf"F_P = \frac{{\dfrac{{(P+1)\,D}}{{2\,[S E - 0.6\,(P+1)]}} + CA}}{{t_{{min}}}}"
-                            rf" = \frac{{\dfrac{{{Pd:g}\times{diameter:g}}}{{2\,[{VESSEL_S_BAR:g}"
-                            rf"\times{VESSEL_E:g} - 0.6\times{Pd:g}]}} + {VESSEL_CA_M}}}{{{VESSEL_TMIN_M}}}"
-                            rf" = {main.FP:.3f}"
-                        )
-                        st.caption("Ec. A.2 con (P + 1), como en los Ejemplos 7.13 y 7.14. "
-                                   "Si el resultado es menor que 1, F_P = 1.")
-                elif eq.has_pressure:
-                    opt = eq.pressure_option(option)
-                    band = next((b for b in opt.bands if pressure <= b.p_max), opt.bands[-1])
-                    if pressure <= 0 or band.is_flat:
-                        st.latex(rf"P = {pressure:g}\ \text{{barg}} \Rightarrow F_P = 1")
-                    else:
-                        lP = math.log10(pressure)
-                        st.latex(
-                            rf"\log_{{10}} F_P = {band.C1:g} {band.C2:+g}\log_{{10}}({pressure:g})"
-                            rf" {band.C3:+g}[\log_{{10}}({pressure:g})]^2"
-                            rf" = {band.C1 + band.C2 * lP + band.C3 * lP * lP:.4f}"
-                        )
-                        st.latex(rf"F_P = {main.FP:.3f}")
-                    st.caption(f"Tabla A.2 · {opt.label}.")
+                if eq.method == "quote":
+                    st.markdown("**1. Escalamiento de la cotización** (Ec. 7.1) y paso a la base "
+                                "CEPCI = 397 (Ec. 7.4)")
+                    st.latex(
+                        rf"C_p = \${form['ref_cost']:,.0f}\left(\frac{{{theme.num(main.capacity)}}}"
+                        rf"{{{theme.num(form['ref_capacity'])}}}\right)^{{{form['exponent']:.2f}}}"
+                        rf"\frac{{397}}{{{form['ref_cepci']:.1f}}} = \${main.Cp0:,.0f}".replace(",", "{,}")
+                    )
+                    st.markdown("**2. Costo de módulo desnudo** con el F_BM que elegiste")
+                    st.latex(rf"C_{{BM}}(2001) = {units}\times\${main.Cp0:,.0f}\times{main.FBM:.2f}"
+                             rf" = \${main.CBM:,.0f}".replace(",", "{,}"))
+                    st.markdown("**3. Actualización por inflación** (Ec. 7.4)")
+                    st.latex(rf"C_{{BM}} = \${main.CBM:,.0f}\times\frac{{{cepci:.1f}}}{{397}} = "
+                             rf"\${main.at(cepci):,.0f}\ \text{{USD}}".replace(",", "{,}"))
                 else:
-                    st.markdown("No aplica para este equipo: F_P = 1.")
+                    lA = math.log10(main.capacity)
+                    st.markdown("**1. Costo de compra a condiciones base** (Ec. A.1, CEPCI = 397)")
+                    st.latex(
+                        rf"\log_{{10}} C_p^\circ = {eq.K1} {eq.K2:+} \log_{{10}}({theme.num(main.capacity)})"
+                        rf" {eq.K3:+} [\log_{{10}}({theme.num(main.capacity)})]^2 = "
+                        rf"{eq.K1 + eq.K2 * lA + eq.K3 * lA * lA:.4f}".replace(",", "{,}")
+                    )
+                    st.latex(rf"C_p^\circ = \${main.Cp0:,.0f}".replace(",", "{,}"))
 
-                st.markdown("**3. Costo de módulo desnudo** (" + METHOD_SOURCE[eq.method] + ")")
-                st.latex(METHOD_EQUATION[eq.method])
-                if eq.method in ("B1B2", "vessel"):
-                    st.latex(rf"F_{{BM}} = {eq.B1} + {eq.B2}\times{main.FM:.2f}\times{main.FP:.3f}"
-                             rf" = {main.FBM:.3f}")
-                elif eq.method == "tray":
-                    st.latex(rf"N = {main.trays},\quad F_q = {main.Fq:.3f},\quad F_{{BM}} = {main.FBM:.2f}")
-                st.latex(rf"C_{{BM}}(2001) = {units}\times\${main.CBM_unit:,.0f} = \${main.CBM:,.0f}"
-                         .replace(",", "{,}"))
+                    st.markdown("**2. Factor de presión**")
+                    if eq.method == "vessel":
+                        if pressure < -0.5:
+                            st.latex(r"P < -0.5\ \text{barg} \Rightarrow F_P = 1.25")
+                        else:
+                            Pd = pressure + VESSEL_GAUGE_OFFSET
+                            st.latex(
+                                rf"F_P = \frac{{\dfrac{{(P+1)\,D}}{{2\,[S E - 0.6\,(P+1)]}} + CA}}{{t_{{min}}}}"
+                                rf" = \frac{{\dfrac{{{Pd:g}\times{diameter:g}}}{{2\,[{VESSEL_S_BAR:g}"
+                                rf"\times{VESSEL_E:g} - 0.6\times{Pd:g}]}} + {VESSEL_CA_M}}}{{{VESSEL_TMIN_M}}}"
+                                rf" = {main.FP:.3f}"
+                            )
+                            st.caption("Ec. A.2 con (P + 1), como en los Ejemplos 7.13 y 7.14. "
+                                       "Si el resultado es menor que 1, F_P = 1.")
+                    elif eq.has_pressure:
+                        opt = eq.pressure_option(option)
+                        band = next((b for b in opt.bands if pressure <= b.p_max), opt.bands[-1])
+                        if pressure <= 0 or band.is_flat:
+                            st.latex(rf"P = {pressure:g}\ \text{{{eq.pressure_unit}}} \Rightarrow F_P = 1")
+                        else:
+                            lP = math.log10(pressure)
+                            st.latex(
+                                rf"\log_{{10}} F_P = {band.C1:g} {band.C2:+g}\log_{{10}}({pressure:g})"
+                                rf" {band.C3:+g}[\log_{{10}}({pressure:g})]^2"
+                                rf" = {band.C1 + band.C2 * lP + band.C3 * lP * lP:.4f}"
+                            )
+                            st.latex(rf"F_P = {main.FP:.3f}")
+                        st.caption(f"Tabla A.2 · {opt.label}.")
+                    else:
+                        st.markdown("No aplica para este equipo: F_P = 1.")
 
-                st.markdown("**4. Actualización por inflación** (Ec. 7.4)")
-                st.latex(rf"C_{{BM}} = \${main.CBM:,.0f}\times\frac{{{cepci:.1f}}}{{397}} = "
-                         rf"\${main.at(cepci):,.0f}\ \text{{USD}}".replace(",", "{,}"))
-                if currency == "MXN":
-                    st.latex(rf"\${main.at(cepci):,.0f}\ \text{{USD}}\times{fx:.2f} = "
-                             rf"\${main.at(cepci) * fx:,.0f}\ \text{{MXN}}".replace(",", "{,}"))
+                    st.markdown("**3. Costo de módulo desnudo** (" + METHOD_SOURCE[eq.method] + ")")
+                    st.latex(METHOD_EQUATION[eq.method])
+                    if eq.method in ("B1B2", "vessel"):
+                        st.latex(rf"F_{{BM}} = {eq.B1} + {eq.B2}\times{main.FM:.2f}\times{main.FP:.3f}"
+                                 rf" = {main.FBM:.3f}")
+                    elif eq.method == "tray":
+                        st.latex(rf"N = {main.trays},\quad F_q = {main.Fq:.3f},\quad F_{{BM}} = {main.FBM:.2f}")
+                    elif eq.superheat:
+                        st.latex(rf"F_T = 1 + 0.00184\,({superheat:g}) - 0.00000335\,({superheat:g})^2"
+                                 rf" = {main.FT:.4f}")
+                        st.caption("Tabla A.5: C_BM = Cp° F_BM F_P F_T para calderas de vapor.")
+                    st.latex(rf"C_{{BM}}(2001) = {units}\times\${main.CBM_unit:,.0f} = \${main.CBM:,.0f}"
+                             .replace(",", "{,}"))
+
+                    st.markdown("**4. Actualización por inflación** (Ec. 7.4)")
+                    st.latex(rf"C_{{BM}} = \${main.CBM:,.0f}\times\frac{{{cepci:.1f}}}{{397}} = "
+                             rf"\${main.at(cepci):,.0f}\ \text{{USD}}".replace(",", "{,}"))
+                    if currency == "MXN":
+                        st.latex(rf"\${main.at(cepci):,.0f}\ \text{{USD}}\times{fx:.2f} = "
+                                 rf"\${main.at(cepci) * fx:,.0f}\ \text{{MXN}}".replace(",", "{,}"))
 
 
 # ===========================================================================
@@ -566,7 +673,7 @@ with tab_plant:
             "Equipo": r.equipment.name,
             "Tamaño": f"{theme.num(r.capacity)} {r.equipment.unit}",
             "Material": r.material.code,
-            "P (barg)": spec.get("pressure", 0.0) if r.equipment.has_pressure else float("nan"),
+            "Presión": pressure_text(spec, r),
             "Unid.": r.units,
             "F_BM": round(r.FBM, 2),
             f"C_BM ({currency})": round(r.at(cepci) * fx),
@@ -581,7 +688,6 @@ with tab_plant:
                 f"C°_BM ({currency})": st.column_config.NumberColumn(format="localized"),
                 "% de ΣC_BM": st.column_config.ProgressColumn(
                     format="%.1f %%", min_value=0, max_value=100, width="small"),
-                "P (barg)": st.column_config.NumberColumn(format="%.1f"),
             },
         )
         selected_rows = event.selection.rows if event else []
@@ -601,7 +707,8 @@ with tab_plant:
             "Etiqueta": spec["tag"], "Clave": r.equipment.key, "Equipo": r.equipment.name,
             "Categoría": r.equipment.category, "Capacidad": r.capacity,
             "Unidad": r.equipment.unit, "Unidades": r.units, "Material": r.material.code,
-            "Presión (barg)": spec.get("pressure"), "Diámetro (m)": spec.get("diameter"),
+            "Presión": spec.get("pressure"), "Unidad de presión": r.equipment.pressure_unit,
+            "Diámetro (m)": spec.get("diameter"),
             "Longitud (m)": spec.get("length"), "Platos": r.trays, "F_M": r.FM, "F_P": r.FP,
             "F_BM": r.FBM, "F_q": r.Fq, "Cp0 por unidad (USD 2001)": round(r.Cp0, 2),
             "C_BM (USD 2001)": round(r.CBM, 2), "C0_BM (USD 2001)": round(r.CBM0, 2),
@@ -633,7 +740,7 @@ with tab_plant:
             data = json.loads(upload.getvalue().decode("utf-8"))
             items = data["equipos"] if isinstance(data, dict) else data
             for it in items:
-                if it.get("equipment") not in EQUIPMENT:
+                if it.get("equipment") not in EQUIPMENT and it.get("equipment") != QUOTE_KEY:
                     raise KeyError(f"equipo desconocido: {it.get('equipment')}")
                 run(it)
             ss.plant = []
@@ -682,6 +789,12 @@ with tab_ref:
 - **Tanques API.** El libro no da F_BM; COSTIQ supone 1.0 y permite cambiarlo.
 - **Reactores.** F_BM = 4.0 es una estimación del libro (Tabla A.7).
 - **Compresores.** Se costean sin accionamiento; el motor o la turbina va aparte.
+- **Evaporadores.** La Tabla A.2 imprime «P < 0» para el primer tramo; la correlación
+  da F_P = 1 en 10 barg, así que COSTIQ usa P < 10.
+- **Calderas de vapor.** El libro no da F_BM; COSTIQ supone 2.16 (calentador de fluido
+  térmico) y permite cambiarlo. F_T corrige por sobrecalentamiento.
+- **Cotización propia.** Para equipos sin correlación (molinos, extrusores, membranas,
+  túneles de congelación) se escala un precio de referencia con la Ec. 7.1.
 """)
         theme.section("Cita")
         st.code("Turton, R., Shaeiwitz, J. A., Bhattacharyya, D., & Whiting, W. B. (2018).\n"
@@ -690,8 +803,8 @@ with tab_ref:
 
     theme.section("Catálogo de equipos", f"{len(EQUIPMENT_LIST)} tipos en "
                                           f"{len(CATEGORIES)} categorías.")
-    cat_filter = st.segmented_control("Categoría", ["Todas"] + list(CATEGORIES), default="Todas",
-                                      key="ref_cat", label_visibility="collapsed") or "Todas"
+    cat_filter = st.selectbox("Categoría", ["Todas"] + list(CATEGORIES), key="ref_cat",
+                              label_visibility="collapsed")
     st.dataframe(pd.DataFrame([{
         "Categoría": e.category, "Equipo": e.name, "Nombre en Turton": e.name_en,
         "Atributo": f"{e.attribute} ({e.unit})", "Mín.": e.a_min, "Máx.": e.a_max,
@@ -717,7 +830,7 @@ with tab_ref:
         } for m in re_eq.materials]), hide_index=True, width="stretch")
         if re_eq.pressure:
             st.dataframe(pd.DataFrame([{
-                "Correlación": opt.label, "Hasta (barg)": b.p_max,
+                "Correlación": opt.label, f"Hasta ({re_eq.pressure_unit})": b.p_max,
                 "C₁": b.C1, "C₂": b.C2, "C₃": b.C3,
             } for opt in re_eq.pressure for b in opt.bands]), hide_index=True, width="stretch",
                 column_config={c: st.column_config.NumberColumn(format="%.6g")

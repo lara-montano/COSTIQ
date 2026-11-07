@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "costiq"
-version = "2.0.0"
+version = "2.1.0"
 description = "Estimación de costos de equipo de proceso con el método de módulo de Turton et al. (2018)"
 readme = "README.md"
 license = { text = "MIT" }
