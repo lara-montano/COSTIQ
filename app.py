@@ -1,1109 +1,732 @@
-"""
-Estimador de Costos de Equipos de Proceso — COSTIQ
-Basado en Turton et al. (2018) - Apéndice A
-Analysis, Synthesis, and Design of Chemical Processes, 5th Edition.
-Desarrollado con Streamlit + Plotly
+"""COSTIQ: interfaz web para costear equipo de proceso (Turton et al., 2018).
+
+Ejecutar con:  streamlit run app.py
 """
 
+from __future__ import annotations
+
+import json
 import math
-import streamlit as st
-import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import re
 from datetime import datetime
 
-from data import (
-    CEPCI, CEPCI_BASE, EQUIPMENT, B1B2, FM_MAP,
-    FBM_FIXED, PRESSURE_FACTORS, COST_METHOD,
+import pandas as pd
+import streamlit as st
+
+from costiq import __version__
+from costiq.data import (
+    CATEGORIES, CEPCI, CEPCI_BASE, EQUIPMENT, EQUIPMENT_LIST, F_AUXILIARY,
+    F_CONTINGENCY, F_FEE, METHOD_EQUATION, METHOD_SOURCE, TAG_PREFIX, TANKS,
+    VESSEL_CA_M, VESSEL_E, VESSEL_S_BAR, VESSEL_TMIN_M,
 )
+from costiq.engine import (
+    VESSEL_GAUGE_OFFSET, CostError, CostResult, cost, plant_summary, tray_area,
+    vessel_volume,
+)
+from ui import charts, theme
 
-# ============================================================
-# Funciones de cálculo
-# ============================================================
+st.set_page_config(
+    page_title="COSTIQ · Costeo de equipo de proceso",
+    page_icon=":material/precision_manufacturing:",
+    layout="wide",
+    initial_sidebar_state="auto",
+)
+theme.inject()
 
-def calc_cp0(K1, K2, K3, A):
-    """Costo base de compra (Eq. A.1). Cp° en USD (CEPCI=397)."""
-    log_A = math.log10(A)
-    log_Cp = K1 + K2 * log_A + K3 * log_A**2
-    return 10**log_Cp
+ss = st.session_state
+ss.setdefault("plant", [])
+ss.setdefault("next_id", 1)
+ss.setdefault("last_upload", None)
 
+ENGINE_KEYS = ("equipment", "capacity", "material", "pressure", "pressure_option",
+               "diameter", "length", "trays", "units", "fbm_override")
 
-def calc_fp_equation(C1, C2, C3, P):
-    """Factor de presión con Eq. A.3. P en barg."""
-    if P <= 0:
-        return 1.0
-    log_P = math.log10(P)
-    log_FP = C1 + C2 * log_P + C3 * log_P**2
-    FP = 10**log_FP
-    return max(FP, 1.0)
-
-
-def calc_fp_vessel(P, D):
-    """Factor de presión para recipientes (Eq. A.2).
-    P en barg, D en metros.
-    FP = ((P*D)/(2*(850-0.6*P)) + 0.00315) / 0.0063
-    donde 0.0063 = espesor mínimo de pared (m).
-    """
-    if P < -0.5:
-        return 1.25  # Vacío según Turton
-    if P <= 0:
-        return 1.0
-    # Guardia: denominador 2*(850 - 0.6*P) → cero cuando P ≈ 1416.67 barg
-    # Para P > ~1400 barg la ecuación pierde validez física (singularidad ASME)
-    denom = 2 * (850 - 0.6 * P)
-    if denom <= 0:
-        return 50.0  # Valor alto seguro; ecuación no válida a esta presión
-    numerator = (P * D) / denom + 0.00315
-    FP = numerator / 0.0063
-    return max(FP, 1.0)
+EXAMPLE_714 = [
+    dict(tag="E-101", equipment="hx_floating_head", capacity=170, material="CS/CS",
+         pressure=5.0, pressure_option="both"),
+    dict(tag="E-102", equipment="hx_floating_head", capacity=205, material="CS/SS",
+         pressure=18.0, pressure_option="both"),
+    dict(tag="E-103", equipment="hx_double_pipe", capacity=10, material="CS/CS",
+         pressure=5.0, pressure_option="all"),
+    dict(tag="P-101 A/B", equipment="pump_centrifugal", capacity=5, material="CS",
+         pressure=5.0, pressure_option="all", units=2),
+    dict(tag="T-101", equipment="tower", material="CS", pressure=5.0, diameter=2.1,
+         length=23.0),
+    dict(tag="T-101 · platos", equipment="tray_sieve", capacity=round(tray_area(2.1), 4),
+         material="SS", trays=32),
+    dict(tag="V-101", equipment="vessel_horizontal", material="CS", pressure=5.0,
+         diameter=1.8, length=6.0),
+]
 
 
-def calc_fq(N):
-    """Factor de cantidad para platos (Fq). N = número de platos."""
-    if N >= 20:
-        return 1.0
-    if N <= 0:
-        return 1.0
-    log_N = math.log10(N)
-    log_Fq = 0.4771 + 0.08516 * log_N - 0.3473 * log_N**2
-    return 10**log_Fq
+def run(spec: dict) -> CostResult:
+    return cost(**{k: spec[k] for k in ENGINE_KEYS if spec.get(k) is not None})
 
 
-# Equipos shell-and-tube con FP separado para shell y tube
-HX_WITH_SIDES = {
-    "Floating head", "Fixed tube sheet", "U-tube",
-    "Bayonet", "Kettle reboiler", "Spiral tube",
+def next_tag(prefix: str, extra: list[str] = ()) -> str:
+    nums = []
+    for tag in [s["tag"] for s in ss.plant] + list(extra):
+        m = re.match(rf"^{re.escape(prefix)}-(\d+)", tag)
+        if m:
+            nums.append(int(m.group(1)))
+    return f"{prefix}-{max(nums) + 1 if nums else 101}"
+
+
+def add_specs(specs: list[dict]) -> None:
+    for spec in specs:
+        ss.plant.append({**spec, "id": ss.next_id})
+        ss.next_id += 1
+
+
+def factor_name(method: str) -> str:
+    return "F_M" if method in ("B1B2", "vessel") else "F_BM"
+
+
+# ===========================================================================
+# Barra lateral: parámetros del proyecto
+# ===========================================================================
+
+with st.sidebar:
+    theme.eyebrow("Actualización de costos")
+    years = sorted(CEPCI, reverse=True)
+    cepci_choice = st.selectbox(
+        "Índice CEPCI",
+        years + ["custom"],
+        format_func=lambda y: "Otro valor…" if y == "custom" else f"{y}  ·  {CEPCI[y]:.1f}",
+        help="Chemical Engineering Plant Cost Index anual. Elige «Otro valor…» "
+             "para usar un índice mensual o más reciente.",
+    )
+    if cepci_choice == "custom":
+        cepci = st.number_input("Valor del CEPCI", min_value=100.0, max_value=5000.0,
+                                value=CEPCI[years[0]], step=0.1, format="%.1f")
+        cepci_text = f"{cepci:.1f}"
+        cepci_year = None
+    else:
+        cepci = CEPCI[cepci_choice]
+        cepci_text = f"{cepci_choice} · {cepci:.1f}"
+        cepci_year = cepci_choice
+    st.caption(f"Base de las correlaciones: {CEPCI_BASE:g} (mayo a septiembre de 2001). "
+               f"Factor de actualización: ×{cepci / CEPCI_BASE:.3f}.")
+
+    st.space("small")
+    theme.eyebrow("Moneda")
+    currency = st.segmented_control("Moneda", ["USD", "MXN"], default="USD",
+                                    label_visibility="collapsed", key="currency") or "USD"
+    fx = 1.0
+    if currency == "MXN":
+        fx = st.number_input("Tipo de cambio (MXN por USD)", min_value=1.0, max_value=100.0,
+                             value=17.50, step=0.05, format="%.2f",
+                             help="Usa el tipo de cambio FIX de Banxico de la fecha del estimado.")
+
+    st.space("small")
+    theme.eyebrow("Costo de planta")
+    with st.expander("Factores de las Ecs. 7.15 y 7.16"):
+        f_cont = st.number_input("Contingencia (% de C_BM)", 0.0, 100.0,
+                                 F_CONTINGENCY * 100, 1.0, format="%.0f") / 100
+        f_fee = st.number_input("Honorarios (% de C_BM)", 0.0, 50.0,
+                                F_FEE * 100, 1.0, format="%.0f") / 100
+        f_aux = st.number_input("Instalaciones auxiliares (% de C°_BM)", 0.0, 200.0,
+                                F_AUXILIARY * 100, 5.0, format="%.0f") / 100
+        st.caption("Valores del libro: 15 %, 3 % y 50 %. Las auxiliares van de 20 % a más "
+                   "de 100 % según el sitio.")
+
+    st.space("medium")
+    st.caption(f"COSTIQ {__version__} · [Código fuente](https://github.com/lara-montano/COSTIQ)")
+
+
+def fmt(v: float) -> str:
+    return theme.money_short(v, 1.0)
+
+
+# ===========================================================================
+# Encabezado y pestañas
+# ===========================================================================
+
+theme.header(cepci_text, len(ss.plant))
+
+tab_eq, tab_plant, tab_ref = st.tabs([
+    ":material/tune: Equipo",
+    ":material/factory: Planta",
+    ":material/menu_book: Referencia",
+])
+
+METHOD_LABEL = {
+    "B1B2": "Cp°(B₁ + B₂ F_M F_P)",
+    "vessel": "Cp°(B₁ + B₂ F_M F_P), F_P por Ec. A.2",
+    "FBM": "Cp° F_BM",
+    "FBM_FP": "Cp° F_BM F_P",
+    "tray": "Cp° N F_BM F_q",
 }
 
 
-def get_fp(category, equip_name, P, D=None, pressure_side="shell"):
-    """Obtiene el factor de presión para un equipo dado."""
-    method = COST_METHOD.get(category, "")
-
-    if method == "vessel":
-        if D is None:
-            D = 1.0
-        return calc_fp_vessel(P, D)
-
-    if category in PRESSURE_FACTORS and equip_name in PRESSURE_FACTORS[category]:
-        pf_list = PRESSURE_FACTORS[category][equip_name]
-
-        if equip_name in HX_WITH_SIDES:
-            for pf in pf_list:
-                if pf.get("side") == pressure_side:
-                    pmin, pmax = pf["range"]
-                    if pmin <= P <= pmax:
-                        return calc_fp_equation(pf["C1"], pf["C2"], pf["C3"], P)
-            return 1.0
-
-        for pf in pf_list:
-            if "side" not in pf:
-                pmin, pmax = pf["range"]
-                if pmin <= P <= pmax:
-                    return calc_fp_equation(pf["C1"], pf["C2"], pf["C3"], P)
-
-        return 1.0
-
-    return 1.0
-
-
-def get_materials_list(category, equip_name):
-    """Retorna la lista de materiales disponibles para un equipo."""
-    method = COST_METHOD[category]
-    if method in ("B1B2", "vessel"):
-        fm_table = FM_MAP.get(category, {}).get(equip_name, {})
-        return list(fm_table.keys()) if fm_table else ["CS"]
-    elif method in ("FBM", "FBM_FP", "tray"):
-        fbm_table = FBM_FIXED.get(category, {}).get(equip_name, {})
-        return list(fbm_table.keys()) if fbm_table else ["Default"]
-    return ["Default"]
-
-
-def calc_cost(category, equip_name, A, material, P, D, N, cepci_year,
-              pressure_side="shell"):
-    """Calcula el costo de módulo desnudo (CBM) actualizado."""
-    equip_data = EQUIPMENT[category][equip_name]
-    K1, K2, K3 = equip_data["K1"], equip_data["K2"], equip_data["K3"]
-
-    Cp0 = calc_cp0(K1, K2, K3, A)
-
-    method = COST_METHOD[category]
-    FP = 1.0
-    FM = 1.0
-    FBM = 1.0
-    Fq = 1.0
-
-    if method == "B1B2":
-        b = B1B2[category][equip_name]
-        B1, B2 = b["B1"], b["B2"]
-        fm_table = FM_MAP.get(category, {}).get(equip_name, {})
-        FM = fm_table.get(material, 1.0)
-        FP = get_fp(category, equip_name, P, pressure_side=pressure_side)
-        FBM = B1 + B2 * FM * FP
-        CBM = Cp0 * FBM
-
-    elif method == "vessel":
-        b = B1B2[category][equip_name]
-        B1, B2 = b["B1"], b["B2"]
-        fm_table = FM_MAP.get(category, {}).get(equip_name, {})
-        FM = fm_table.get(material, 1.0)
-        FP = calc_fp_vessel(P, D)
-        FBM = B1 + B2 * FM * FP
-        CBM = Cp0 * FBM
-
-    elif method == "FBM":
-        fbm_table = FBM_FIXED.get(category, {}).get(equip_name, {})
-        FBM = fbm_table.get(material, list(fbm_table.values())[0] if fbm_table else 1.0)
-        CBM = Cp0 * FBM
-
-    elif method == "FBM_FP":
-        fbm_table = FBM_FIXED.get(category, {}).get(equip_name, {})
-        FBM = fbm_table.get(material, list(fbm_table.values())[0] if fbm_table else 1.0)
-        FP = get_fp(category, equip_name, P)
-        CBM = Cp0 * FBM * FP
-
-    elif method == "tray":
-        fbm_table = FBM_FIXED.get(category, {}).get(equip_name, {})
-        FBM = fbm_table.get(material, list(fbm_table.values())[0] if fbm_table else 1.0)
-        Fq = calc_fq(N)
-        CBM = Cp0 * N * FBM * Fq
-
-    else:
-        CBM = Cp0
-
-    cepci_target = CEPCI.get(cepci_year, CEPCI_BASE)
-    CBM_updated = CBM * (cepci_target / CEPCI_BASE)
-
-    return {
-        "Cp0": Cp0,
-        "FM": FM,
-        "FP": FP,
-        "FBM": FBM,
-        "Fq": Fq,
-        "N": N,
-        "CBM_base": CBM,
-        "CEPCI_base": CEPCI_BASE,
-        "CEPCI_target": cepci_target,
-        "CBM_updated": CBM_updated,
-        "method": method,
-    }
-
-
-def cost_evolution(category, equip_name, A, material, P, D, N,
-                   pressure_side="shell"):
-    """Calcula la evolución del costo a través de los años."""
-    years = sorted(CEPCI.keys())
-    costs = []
-    for year in years:
-        result = calc_cost(category, equip_name, A, material, P, D, N, year,
-                           pressure_side=pressure_side)
-        costs.append(result["CBM_updated"])
-    return years, costs
-
-
-# ============================================================
-# Configuración de página
-# ============================================================
-
-st.set_page_config(
-    page_title="COSTIQ — Costeo de Equipos",
-    page_icon="⚙️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# --- CSS ---
-st.markdown("""
-<style>
-    /* Header */
-    .main-header {
-        background: linear-gradient(135deg, #0f2027 0%, #203a43 40%, #2c5364 100%);
-        padding: 1.8rem 2.2rem;
-        border-radius: 12px;
-        margin-bottom: 1.2rem;
-        color: white;
-        box-shadow: 0 4px 15px rgba(0,0,0,0.3);
-    }
-    .main-header h1 {
-        color: white;
-        margin: 0;
-        font-size: 1.7rem;
-        font-weight: 700;
-        letter-spacing: -0.02em;
-    }
-    .main-header .subtitle {
-        color: #a8d0e6;
-        margin: 0.25rem 0 0 0;
-        font-size: 0.88rem;
-    }
-    .main-header .badge {
-        display: inline-block;
-        background: rgba(255,255,255,0.15);
-        padding: 0.2rem 0.7rem;
-        border-radius: 20px;
-        font-size: 0.72rem;
-        color: #d5e8f0;
-        margin-top: 0.5rem;
-        letter-spacing: 0.03em;
-    }
-
-    /* Metric cards */
-    [data-testid="stMetric"] {
-        background: linear-gradient(135deg, #0e1117 0%, #161b22 100%);
-        border: 1px solid #30363d;
-        border-radius: 10px;
-        padding: 14px 18px;
-        transition: border-color 0.3s;
-    }
-    [data-testid="stMetric"]:hover {
-        border-color: #2e86c1;
-    }
-    [data-testid="stMetricLabel"] {
-        font-size: 0.78rem;
-        color: #8b949e;
-    }
-    [data-testid="stMetricValue"] {
-        font-size: 1.25rem;
-        font-weight: 600;
-    }
-
-    /* Sidebar */
-    [data-testid="stSidebar"] {
-        background-color: #0a0e14;
-    }
-    [data-testid="stSidebar"] hr {
-        border-color: #1e3a5f;
-    }
-
-    /* Section labels */
-    .section-label {
-        font-size: 0.7rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.1em;
-        color: #2e86c1;
-        margin-bottom: 0.3rem;
-    }
-
-    /* Total plant card */
-    .total-card {
-        background: linear-gradient(135deg, #1a3a2a 0%, #0d2818 100%);
-        border: 2px solid #27ae60;
-        border-radius: 12px;
-        padding: 1.2rem 1.5rem;
-        margin: 0.8rem 0;
-        text-align: center;
-    }
-    .total-card h3 {
-        color: #27ae60;
-        margin: 0 0 0.3rem 0;
-        font-size: 0.9rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-    }
-    .total-card .amount {
-        color: #2ecc71;
-        font-size: 1.6rem;
-        font-weight: 700;
-        margin: 0;
-    }
-    .total-card .sub {
-        color: #7dcea0;
-        font-size: 0.8rem;
-        margin: 0.2rem 0 0 0;
-    }
-
-    /* Equipment list item */
-    .equip-item {
-        background: #161b22;
-        border: 1px solid #30363d;
-        border-radius: 8px;
-        padding: 0.7rem 1rem;
-        margin-bottom: 0.5rem;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-    }
-    .equip-item .name {
-        font-size: 0.85rem;
-        color: #c9d1d9;
-    }
-    .equip-item .cost {
-        font-size: 0.9rem;
-        font-weight: 600;
-        color: #2e86c1;
-    }
-
-    /* Credits */
-    .credits {
-        text-align: center;
-        color: #6e7681;
-        font-size: 0.75rem;
-        margin-top: 0.5rem;
-        padding-top: 0.8rem;
-        border-top: 1px solid #21262d;
-        line-height: 1.7;
-    }
-    .credits a {
-        color: #2e86c1;
-        text-decoration: none;
-    }
-    .credits a:hover {
-        text-decoration: underline;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# --- Header ---
-st.markdown("""
-<div class="main-header">
-    <h1>⚙️ COSTIQ — Costeo de Equipos de Proceso</h1>
-    <p class="subtitle">
-        Estimación de costos de módulo desnudo (C<sub>BM</sub>) y grassroots (C<sub>GR</sub>)
-        basada en Turton et al. (2018) — Apéndice A
-    </p>
-    <span class="badge">CEPCI base = 397 · Sept. 2001 · 5ª Edición</span>
-</div>
-""", unsafe_allow_html=True)
-
-# ============================================================
-# Inicializar inventario de equipos en session_state
-# ============================================================
-if "equipment_list" not in st.session_state:
-    st.session_state.equipment_list = []
-if "next_equip_id" not in st.session_state:
-    st.session_state.next_equip_id = 1
-
-# ============================================================
-# Sidebar
-# ============================================================
-with st.sidebar:
-    st.markdown('<p class="section-label">Configuración del equipo</p>',
-                unsafe_allow_html=True)
-
-    category = st.selectbox("Categoría", list(EQUIPMENT.keys()),
-                            help="Tipo de equipo según Turton et al.")
-    equip_name = st.selectbox("Tipo de equipo", list(EQUIPMENT[category].keys()))
-
-    equip_data = EQUIPMENT[category][equip_name]
-
-    st.markdown("---")
-    st.markdown(f"**Parámetro:** {equip_data['units']}")
-    st.markdown(f"**Rango válido:** {equip_data['min']:g} – {equip_data['max']:g}")
-
-    A = st.number_input(
-        f"Capacidad ({equip_data['units']})",
-        min_value=float(equip_data["min"]),
-        max_value=float(equip_data["max"]),
-        value=float(equip_data["min"]),
-        format="%.4f",
-    )
-
-    # Material
-    materials = get_materials_list(category, equip_name)
-    material = st.selectbox("Material de construcción", materials)
-
-    st.markdown("---")
-    st.markdown('<p class="section-label">Condiciones de operación</p>',
-                unsafe_allow_html=True)
-
-    # Presión
-    method = COST_METHOD[category]
-    needs_pressure = method in ("B1B2", "vessel", "FBM_FP")
-    if needs_pressure and (
-        (category in PRESSURE_FACTORS and equip_name in PRESSURE_FACTORS.get(category, {}))
-        or method == "vessel"
-    ):
-        P = st.number_input("Presión de operación (barg)", value=0.0, format="%.2f")
-    else:
-        P = 0.0
-
-    # Selección shell/tube
-    pressure_side = "shell"
-    if (category == "Intercambiadores de calor" and equip_name in HX_WITH_SIDES
-            and needs_pressure):
-        pressure_side = st.radio(
-            "Lado de la presión",
-            options=["shell", "tube"],
-            horizontal=True,
-            help="Lado del intercambiador donde se aplica la presión de diseño",
-        )
-
-    # Diámetro
-    if method == "vessel":
-        D = st.number_input(
-            "Diámetro del recipiente (m)", value=1.0, min_value=0.1, format="%.2f"
-        )
-    else:
-        D = 1.0
-
-    # Número de platos
-    if method == "tray":
-        N = st.number_input("Número de platos", value=10, min_value=1, max_value=500)
-    else:
-        N = 1
-
-    st.markdown("---")
-    st.markdown('<p class="section-label">Actualización temporal</p>',
-                unsafe_allow_html=True)
-
-    cepci_year = st.selectbox(
-        "Año CEPCI", sorted(CEPCI.keys(), reverse=True)
-    )
-
-    # Tipo de cambio
-    st.markdown("---")
-    st.markdown('<p class="section-label">Moneda</p>', unsafe_allow_html=True)
-    show_mxn = st.toggle("Mostrar en MXN", value=False,
-                         help="Convierte los costos usando el tipo de cambio indicado")
-    if show_mxn:
-        tc_mxn = st.number_input("Tipo de cambio (MXN/USD)", value=17.50,
-                                 min_value=1.0, max_value=50.0, format="%.2f")
-    else:
-        tc_mxn = 1.0
-
-    # Contingency y fees para Grassroots
-    st.markdown("---")
-    st.markdown('<p class="section-label">Costo Grassroots</p>', unsafe_allow_html=True)
-    with st.expander("Factores de contingencia", expanded=False):
-        st.caption("C_GR = C_BM × (1 + f₁ + f₂)")
-        f_contingency = st.slider("Contingencia (f₁)", 0.0, 0.5, 0.15, 0.01,
-                                  help="Típicamente 15%")
-        f_fees = st.slider("Honorarios (f₂)", 0.0, 0.3, 0.03, 0.01,
-                           help="Típicamente 3%")
-
-    # Instrucciones
-    with st.expander("📖 Instrucciones"):
-        st.markdown("""
-1. **Seleccione** la categoría y tipo de equipo.
-2. **Ingrese** la capacidad dentro del rango válido.
-3. **Elija** el material de construcción.
-4. Si aplica, ingrese la **presión** (barg) y el **lado** (shell/tube).
-5. Para recipientes/torres, ingrese el **diámetro** (m).
-6. Para platos, indique el **número** de platos.
-7. Seleccione el **año CEPCI**.
-8. Use **"Agregar al inventario"** para costear múltiples equipos.
-
-**Ecuaciones principales:**
-- *Eq. A.1:* Costo base Cp° con K₁, K₂, K₃
-- *Eq. A.2:* Factor de presión FP (recipientes, ASME)
-- *Eq. A.3:* Factor de presión FP (otros equipos)
-- *Eq. A.4:* Costo de módulo desnudo CBM
-""")
-
-# ============================================================
-# Cálculo principal
-# ============================================================
-result = calc_cost(category, equip_name, A, material, P, D, N, cepci_year,
-                   pressure_side=pressure_side)
-
-# Advertencia si la presión está fuera de rango
-if needs_pressure and P != 0.0 and result["FP"] == 1.0:
-    if method == "vessel" and P > 0:
-        pass  # vessel siempre calcula FP, no hay rango tabular
-    elif category in PRESSURE_FACTORS and equip_name in PRESSURE_FACTORS.get(category, {}):
-        pf_list = PRESSURE_FACTORS[category][equip_name]
-        in_range = False
-        for pf in pf_list:
-            pmin, pmax = pf["range"]
-            if pmin <= P <= pmax:
-                in_range = True
-                break
-        if not in_range:
-            st.warning(f"⚠️ La presión {P:.1f} barg está fuera del rango tabulado "
-                       f"para {equip_name}. F_P se asume como 1.0.")
-
-currency = "MXN" if show_mxn else "USD"
-fx = tc_mxn if show_mxn else 1.0
-CBM_display = result["CBM_updated"] * fx
-CGR_display = CBM_display * (1 + f_contingency + f_fees)
-
-# ============================================================
-# Layout principal con tabs
-# ============================================================
-tab_single, tab_inventory, tab_charts, tab_reference = st.tabs([
-    "📊 Equipo individual",
-    "📋 Inventario de planta",
-    "📈 Análisis gráfico",
-    "📚 Referencia",
-])
-
-# ============================================================
-# TAB 1: Equipo individual
-# ============================================================
-with tab_single:
-    col_res, col_eq = st.columns([3, 2])
-
-    with col_res:
-        # Metrics row 1
-        c1, c2, c3 = st.columns(3)
-        cp0_label = "Cp° base (USD, 2001)" if show_mxn else "Cp° base (2001)"
-        c1.metric(cp0_label, f"${result['Cp0']:,.0f} USD")
-        c2.metric(f"C_BM ({cepci_year})", f"${CBM_display:,.0f} {currency}")
-        c3.metric(f"C_GR ({cepci_year})",
-                  f"${CGR_display:,.0f} {currency}",
-                  help=f"Grassroots = CBM × (1 + {f_contingency:.0%} + {f_fees:.0%})")
-
-        # Metrics row 2
-        c4, c5, c6 = st.columns(3)
-        c4.metric("F_M (material)", f"{result['FM']:.4f}")
-        c5.metric("F_P (presión)", f"{result['FP']:.4f}")
-        c6.metric("F_BM (módulo)", f"{result['FBM']:.4f}")
-
-        if result["method"] == "tray":
-            c7, c8, c9 = st.columns(3)
-            c7.metric("N (platos)", f"{N}")
-            c8.metric("F_q (cantidad)", f"{result['Fq']:.4f}")
-            c9.metric(f"CEPCI {cepci_year}", f"{result['CEPCI_target']:.1f}")
-        else:
-            c7, _, _ = st.columns(3)
-            c7.metric(f"CEPCI {cepci_year}", f"{result['CEPCI_target']:.1f}")
-
-        # Desglose
-        st.markdown("##### Desglose del cálculo")
-        K1, K2, K3 = equip_data["K1"], equip_data["K2"], equip_data["K3"]
-        breakdown = {
-            "Variable": [
-                "A (capacidad)", "K₁", "K₂", "K₃",
-                "Cp° (USD, 2001)",
-                "F_M", "F_P", "F_BM",
-            ],
-            "Valor": [
-                f"{A:,.4f}", f"{K1}", f"{K2}", f"{K3}",
-                f"${result['Cp0']:,.2f}",
-                f"{result['FM']:.4f}", f"{result['FP']:.4f}", f"{result['FBM']:.4f}",
-            ],
-        }
-        if result["method"] == "tray":
-            breakdown["Variable"].extend(["N (platos)", "F_q"])
-            breakdown["Valor"].extend([f"{N}", f"{result['Fq']:.4f}"])
-
-        breakdown["Variable"].extend([
-            f"C_BM base ({currency}, 2001)",
-            f"CEPCI {cepci_year}",
-            f"C_BM actualizado ({currency}, {cepci_year})",
-            f"C_GR ({currency}, {cepci_year})",
-        ])
-        breakdown["Valor"].extend([
-            f"${result['CBM_base'] * fx:,.2f}",
-            f"{result['CEPCI_target']:.1f}",
-            f"${CBM_display:,.2f}",
-            f"${CGR_display:,.2f}",
-        ])
-
-        df_bd = pd.DataFrame(breakdown)
-        st.dataframe(df_bd, use_container_width=True, hide_index=True)
-
-        # Botón agregar al inventario
-        st.markdown("")
-        col_btn1, col_btn2 = st.columns([1, 1])
-        with col_btn1:
-            if st.button("➕ Agregar al inventario de planta", use_container_width=True,
-                         type="primary"):
-                item = {
-                    "id": st.session_state.next_equip_id,
-                    "category": category,
-                    "equip_name": equip_name,
-                    "A": A,
-                    "units": equip_data["units"],
-                    "material": material,
-                    "P": P,
-                    "D": D,
-                    "N": N,
-                    "pressure_side": pressure_side,
-                    "Fq": result["Fq"],
-                }
-                st.session_state.next_equip_id += 1
-                st.session_state.equipment_list.append(item)
-                st.toast(f"✅ {equip_name} agregado al inventario", icon="✅")
-                st.rerun()
-
-    with col_eq:
-        # Ecuaciones
-        st.markdown("##### Ecuaciones utilizadas")
-
-        st.latex(r"\log_{10}(C_p^\circ) = K_1 + K_2 \log_{10}(A) + K_3 [\log_{10}(A)]^2")
-        st.caption(f"K₁ = {K1}, K₂ = {K2}, K₃ = {K3}, A = {A:g}")
-
-        if result["method"] == "B1B2":
-            b = B1B2[category][equip_name]
-            st.latex(r"C_{BM} = C_p^\circ \left(B_1 + B_2 \, F_M \, F_P\right)")
-            st.caption(f"B₁ = {b['B1']}, B₂ = {b['B2']}, "
-                       f"F_M = {result['FM']:.4f}, F_P = {result['FP']:.4f}")
-        elif result["method"] == "vessel":
-            b = B1B2[category][equip_name]
-            st.latex(
-                r"F_P = \frac{\dfrac{P \cdot D}{2\,(850 - 0.6\,P)} + 0.00315}{0.0063}"
+# ===========================================================================
+# Pestaña 1: un equipo
+# ===========================================================================
+
+with tab_eq:
+    col_in, col_out = st.columns([0.36, 0.64], gap="large")
+
+    # --- Entradas ---------------------------------------------------------
+    with col_in:
+        with st.container(border=True):
+            theme.eyebrow("Equipo")
+            category = st.selectbox("Categoría", list(CATEGORIES), key="in_category")
+            eq_key = st.selectbox(
+                "Tipo", [e.key for e in CATEGORIES[category]],
+                format_func=lambda k: EQUIPMENT[k].name, key=f"in_type_{category}",
+                help="Nombre original en Turton: se muestra al pie del formulario.",
             )
-            st.latex(r"C_{BM} = C_p^\circ \left(B_1 + B_2 \, F_M \, F_P\right)")
-            st.caption(f"B₁ = {b['B1']}, B₂ = {b['B2']}, "
-                       f"F_M = {result['FM']:.4f}, F_P = {result['FP']:.4f}")
-        elif result["method"] == "FBM":
-            st.latex(r"C_{BM} = C_p^\circ \cdot F_{BM}")
-            st.caption(f"F_BM = {result['FBM']:.4f}")
-        elif result["method"] == "FBM_FP":
-            st.latex(r"C_{BM} = C_p^\circ \cdot F_{BM} \cdot F_P")
-            st.caption(f"F_BM = {result['FBM']:.4f}, F_P = {result['FP']:.4f}")
-        elif result["method"] == "tray":
-            st.latex(r"C_{BM} = C_p^\circ \cdot N \cdot F_{BM} \cdot F_q")
-            st.caption(f"N = {N}, F_BM = {result['FBM']:.4f}, F_q = {result['Fq']:.4f}")
+            eq = EQUIPMENT[eq_key]
+            k = eq.key
 
-        cepci_val = result["CEPCI_target"]
-        st.latex(
-            r"C_{actualizado} = C_{BM} \times "
-            r"\frac{CEPCI_{" + str(cepci_year) + r"}}{CEPCI_{2001}} = "
-            r"C_{BM} \times \frac{" + f"{cepci_val:.1f}" + r"}{397}"
-        )
-
-        st.latex(
-            r"C_{GR} = C_{BM} \times (1 + f_1 + f_2)"
-        )
-        st.caption(f"f₁ = {f_contingency:.2f} (contingencia), f₂ = {f_fees:.2f} (honorarios)")
-
-        # Material comparison mini-chart
-        st.markdown("##### Comparación por material")
-        mat_list = get_materials_list(category, equip_name)
-        if len(mat_list) > 1:
-            mat_costs = []
-            mat_names = []
-            for m in mat_list:
-                r = calc_cost(category, equip_name, A, m, P, D, N, cepci_year,
-                              pressure_side=pressure_side)
-                mat_costs.append(r["CBM_updated"] * fx)
-                mat_names.append(m)
-
-            colors = ["#2e86c1" if m != material else "#e74c3c" for m in mat_names]
-            fig_mat = go.Figure(go.Bar(
-                x=mat_names, y=mat_costs,
-                marker_color=colors,
-                text=[f"${c:,.0f}" for c in mat_costs],
-                textposition="outside",
-                textfont=dict(size=10),
-            ))
-            fig_mat.update_layout(
-                yaxis_title=f"C_BM ({currency})",
-                template="plotly_dark",
-                height=280,
-                margin=dict(l=10, r=10, t=10, b=10),
-                font=dict(size=10),
-                showlegend=False,
-                plot_bgcolor="rgba(0,0,0,0)",
-                paper_bgcolor="rgba(0,0,0,0)",
-            )
-            st.plotly_chart(fig_mat, use_container_width=True)
-        else:
-            st.info("Solo un material disponible para este equipo.")
-
-
-# ============================================================
-# TAB 2: Inventario de planta
-# ============================================================
-with tab_inventory:
-    if not st.session_state.equipment_list:
-        st.info("El inventario está vacío. Usa el botón **'Agregar al inventario'** "
-                "en la pestaña de equipo individual para comenzar a costear tu planta.")
-    else:
-        equip_list = st.session_state.equipment_list
-
-        # Recalcular todos los costos dinámicamente con el CEPCI year actual
-        inv_results = []
-        for e in equip_list:
-            r = calc_cost(
-                e["category"], e["equip_name"], e["A"], e["material"],
-                e["P"], e["D"], e["N"], cepci_year,
-                pressure_side=e.get("pressure_side", "shell"),
-            )
-            cbm = r["CBM_updated"]
-            cgr = cbm * (1 + f_contingency + f_fees)
-            inv_results.append({
-                **e,
-                "Cp0": r["Cp0"],
-                "FM": r["FM"],
-                "FP": r["FP"],
-                "FBM": r["FBM"],
-                "Fq": r["Fq"],
-                "CBM": cbm,
-                "CGR": cgr,
-            })
-
-        # Totales
-        total_cbm = sum(ir["CBM"] for ir in inv_results) * fx
-        total_cgr = sum(ir["CGR"] for ir in inv_results) * fx
-
-        col_t1, col_t2, col_t3 = st.columns(3)
-        with col_t1:
-            st.markdown(f"""
-            <div class="total-card">
-                <h3>Costo Total C_BM</h3>
-                <p class="amount">${total_cbm:,.0f} {currency}</p>
-                <p class="sub">{len(equip_list)} equipo(s) · CEPCI {cepci_year}</p>
-            </div>
-            """, unsafe_allow_html=True)
-        with col_t2:
-            st.markdown(f"""
-            <div class="total-card" style="border-color: #2980b9;
-                background: linear-gradient(135deg, #1a2a3a 0%, #0d1828 100%);">
-                <h3 style="color: #2980b9;">Costo Grassroots C_GR</h3>
-                <p class="amount" style="color: #3498db;">${total_cgr:,.0f} {currency}</p>
-                <p class="sub" style="color: #7db8d4;">
-                    Contingencia {f_contingency:.0%} + Honorarios {f_fees:.0%}
-                </p>
-            </div>
-            """, unsafe_allow_html=True)
-        with col_t3:
-            if show_mxn and fx != 1.0:
-                st.markdown(f"""
-                <div class="total-card" style="border-color: #8e44ad;
-                    background: linear-gradient(135deg, #2a1a3a 0%, #180d28 100%);">
-                    <h3 style="color: #8e44ad;">Equivalente USD</h3>
-                    <p class="amount" style="color: #9b59b6;">
-                        ${total_cgr / fx:,.0f} USD
-                    </p>
-                    <p class="sub" style="color: #bb8fce;">TC: {tc_mxn:.2f} MXN/USD</p>
-                </div>
-                """, unsafe_allow_html=True)
+            theme.eyebrow("Tamaño")
+            diameter = length = capacity = None
+            if eq.method == "vessel":
+                c1, c2 = st.columns(2)
+                diameter = c1.number_input("Diámetro D (m)", min_value=0.1, max_value=20.0,
+                                           value=2.0 if k == "tower" else 1.5, step=0.1,
+                                           format="%.2f", key=f"D_{k}")
+                length = c2.number_input(
+                    "Longitud L (m)" if eq.geometry == "horizontal" else "Altura H (m)",
+                    min_value=0.1, max_value=200.0,
+                    value=20.0 if k == "tower" else 5.0, step=0.5, format="%.2f",
+                    key=f"L_{k}")
+                vol = vessel_volume(diameter, length)
+                inside = eq.a_min <= vol <= eq.a_max
+                st.caption(f"Volumen πD²L/4 = **{theme.num(vol)} m³** · rango de la "
+                           f"correlación {eq.a_min:g}–{eq.a_max:g} m³"
+                           + ("" if inside else " · **fuera de rango**"))
             else:
-                n_cats = len(set(e["category"] for e in equip_list))
-                st.markdown(f"""
-                <div class="total-card" style="border-color: #8e44ad;
-                    background: linear-gradient(135deg, #2a1a3a 0%, #180d28 100%);">
-                    <h3 style="color: #8e44ad;">Resumen</h3>
-                    <p class="amount" style="color: #9b59b6;">{len(equip_list)} equipos</p>
-                    <p class="sub" style="color: #bb8fce;">{n_cats} categoría(s)</p>
-                </div>
-                """, unsafe_allow_html=True)
+                cap_default = theme.nice_default(eq.a_min, eq.a_max)
+                capacity = st.number_input(
+                    f"{eq.attribute} ({eq.unit})", min_value=1e-4, max_value=1e7,
+                    value=cap_default,
+                    step=float(10 ** (math.floor(math.log10(cap_default)) - 1)),
+                    format="%.4g", key=f"cap_{k}",
+                    help="Por unidad. Puedes salir del rango; COSTIQ lo marca como extrapolación.")
+                st.caption(f"Rango de la correlación: {eq.a_min:g}–{eq.a_max:,g} {eq.unit} "
+                           "(Tabla A.1)")
+            units = st.number_input("Unidades idénticas", min_value=1, max_value=50, value=1,
+                                    step=1, key=f"units_{k}",
+                                    help="Equipos en paralelo o de respaldo, p. ej., P-101 A/B.")
 
-        # Tabla de inventario con botón de eliminar por equipo
-        st.markdown("##### Lista de equipos")
-        for idx, ir in enumerate(inv_results):
-            col_id, col_cat, col_eq, col_cap, col_mat, col_cbm, col_cgr, col_del = \
-                st.columns([0.4, 1.2, 1.2, 1.0, 0.8, 1.0, 1.0, 0.5])
-            col_id.markdown(f"**{ir['id']}**")
-            col_cat.markdown(f"{ir['category']}")
-            col_eq.markdown(f"{ir['equip_name']}")
-            col_cap.markdown(f"{ir['A']:,.2f} {ir['units']}")
-            col_mat.markdown(f"{ir['material']}")
-            col_cbm.markdown(f"${ir['CBM'] * fx:,.0f}")
-            col_cgr.markdown(f"${ir['CGR'] * fx:,.0f}")
-            if col_del.button("❌", key=f"del_{ir['id']}",
-                              help=f"Eliminar {ir['equip_name']}"):
-                st.session_state.equipment_list.pop(idx)
-                st.rerun()
-
-        # Gráfica de distribución de costos
-        st.markdown("##### Distribución de costos por equipo")
-        fig_dist = go.Figure(go.Pie(
-            labels=[f"{ir['equip_name']} ({ir['material']})" for ir in inv_results],
-            values=[ir["CBM"] * fx for ir in inv_results],
-            hole=0.45,
-            textinfo="label+percent",
-            textposition="outside",
-            marker=dict(
-                colors=[
-                    "#2e86c1", "#e67e22", "#27ae60", "#e74c3c", "#8e44ad",
-                    "#1abc9c", "#f39c12", "#3498db", "#e91e63", "#00bcd4",
-                ] * 5  # cycle colors
-            ),
-        ))
-        fig_dist.update_layout(
-            template="plotly_dark",
-            height=400,
-            margin=dict(l=20, r=20, t=30, b=20),
-            font=dict(size=11),
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            showlegend=False,
-        )
-        st.plotly_chart(fig_dist, use_container_width=True)
-
-        # Botones de acción
-        col_a, col_b, col_c = st.columns([2, 1, 1])
-        with col_a:
-            # Exportar a CSV — recalculado dinámicamente
-            csv_data = pd.DataFrame([
-                {
-                    "ID": ir["id"],
-                    "Categoría": ir["category"],
-                    "Equipo": ir["equip_name"],
-                    "Capacidad": ir["A"],
-                    "Unidades": ir["units"],
-                    "Material": ir["material"],
-                    "P (barg)": ir["P"],
-                    "D (m)": ir["D"],
-                    "N (platos)": ir["N"],
-                    "CEPCI año": cepci_year,
-                    "Cp0 (USD)": round(ir["Cp0"], 2),
-                    "FM": round(ir["FM"], 4),
-                    "FP": round(ir["FP"], 4),
-                    "FBM": round(ir["FBM"], 4),
-                    "Fq": round(ir["Fq"], 4),
-                    "CBM (USD)": round(ir["CBM"], 2),
-                    "CGR (USD)": round(ir["CGR"], 2),
-                    "f_contingencia": f_contingency,
-                    "f_honorarios": f_fees,
-                }
-                for ir in inv_results
-            ])
-            csv_bytes = csv_data.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "📥 Descargar CSV",
-                data=csv_bytes,
-                file_name=f"costeo_equipos_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv",
-                use_container_width=True,
+            theme.eyebrow("Material y operación")
+            mat_codes = [m.code for m in eq.materials]
+            fname = factor_name(eq.method)
+            material = st.selectbox(
+                "Material de construcción", mat_codes,
+                format_func=lambda c: f"{eq.material(c).label}  ·  {fname} {eq.material(c).factor:.2f}",
+                key=f"mat_{k}", disabled=len(mat_codes) == 1,
             )
-        with col_b:
-            if st.button("🗑️ Eliminar último", use_container_width=True):
-                if st.session_state.equipment_list:
-                    st.session_state.equipment_list.pop()
-                    st.rerun()
-        with col_c:
-            if st.button("🧹 Limpiar inventario", use_container_width=True):
-                st.session_state.equipment_list = []
-                st.rerun()
+
+            pressure, option = 0.0, None
+            if eq.has_pressure:
+                if len(eq.pressure) > 1:
+                    option = st.radio("Correlación de presión (Tabla A.2)",
+                                      [o.key for o in eq.pressure],
+                                      format_func=lambda o: eq.pressure_option(o).label,
+                                      key=f"popt_{k}", horizontal=True)
+                elif eq.pressure:
+                    option = eq.pressure[0].key
+                pressure = st.number_input(f"{eq.pressure_label} (barg)", min_value=-1.0,
+                                           max_value=2000.0, value=0.0, step=1.0,
+                                           format="%.2f", key=f"P_{k}")
+                if eq.method == "vessel":
+                    st.caption("F_P por la Ec. A.2 (ASME), válida para pared delgada.")
+                else:
+                    st.caption(f"Tabla A.2 válida hasta {eq.pressure_limit:g} barg.")
+            elif eq.category == TANKS:
+                st.caption("Tanque atmosférico (P < 0.07 barg). Sin corrección por presión.")
+            else:
+                st.caption("Este equipo no tiene corrección por presión en el libro.")
+
+            trays = 1
+            if eq.method == "tray":
+                trays = st.number_input("Número de platos o eliminadores", min_value=1,
+                                        max_value=300, value=20, step=1, key=f"N_{k}",
+                                        help="F_q = 1 para N ≥ 20 (Tabla A.5).")
+
+            fbm_override = None
+            if eq.category == TANKS:
+                fbm_override = st.number_input("F_BM supuesto", min_value=1.0, max_value=10.0,
+                                               value=1.0, step=0.05, format="%.2f",
+                                               key=f"fbm_{k}", help=eq.note)
+
+            internals = None
+            if k == "tower":
+                theme.eyebrow("Internos de la torre")
+                kind = st.segmented_control("Internos", ["Ninguno", "Platos", "Empaque"],
+                                            default="Platos", key="tower_kind",
+                                            label_visibility="collapsed") or "Ninguno"
+                if kind == "Platos":
+                    c1, c2 = st.columns(2)
+                    tray_key = c1.selectbox("Tipo de plato", ["tray_sieve", "tray_valve"],
+                                            format_func=lambda t: EQUIPMENT[t].name,
+                                            key="tower_tray_type")
+                    n_tr = c2.number_input("Platos", 1, 300, 30, 1, key="tower_n")
+                    t_eq = EQUIPMENT[tray_key]
+                    t_mat = st.selectbox(
+                        "Material de los platos", [m.code for m in t_eq.materials],
+                        format_func=lambda c: f"{t_eq.material(c).label}  ·  F_BM "
+                                              f"{t_eq.material(c).factor:.2f}",
+                        key="tower_tray_mat")
+                    internals = dict(equipment=tray_key, capacity=tray_area(diameter),
+                                     material=t_mat, trays=n_tr, units=units,
+                                     label="platos")
+                    st.caption(f"Área de plato πD²/4 = {theme.num(tray_area(diameter))} m²")
+                elif kind == "Empaque":
+                    c1, c2 = st.columns(2)
+                    h_pk = c1.number_input("Altura empacada (m)", 0.1, 200.0,
+                                           float(round(0.8 * length, 1)), 0.5,
+                                           key="tower_pack_h")
+                    p_eq = EQUIPMENT["packing"]
+                    p_mat = c2.selectbox(
+                        "Material", [m.code for m in p_eq.materials],
+                        format_func=lambda c: p_eq.material(c).label, key="tower_pack_mat")
+                    internals = dict(equipment="packing",
+                                     capacity=tray_area(diameter) * h_pk,
+                                     material=p_mat, units=units, label="empaque")
+                    st.caption(f"Volumen de empaque = {theme.num(tray_area(diameter) * h_pk)} m³")
+
+            st.space("small")
+            prefix = TAG_PREFIX.get(eq.category, "X")
+            tag = st.text_input("Etiqueta en el DFP", value=next_tag(prefix),
+                                key=f"tag_{k}_{ss.next_id}")
+            add_clicked = st.button("Agregar a la planta", type="primary",
+                                    icon=":material/add:", width="stretch")
+            st.caption(f"Turton: *{eq.name_en}* · {METHOD_SOURCE[eq.method]}")
+
+    # --- Cálculo ------------------------------------------------------------
+    main_spec = dict(tag=tag, equipment=k, capacity=capacity, material=material,
+                     pressure=pressure, pressure_option=option, diameter=diameter,
+                     length=length, trays=trays, units=units, fbm_override=fbm_override)
+    specs = [main_spec]
+    if internals:
+        label = internals.pop("label")
+        specs.append(dict(tag=f"{tag} · {label}", **internals))
+
+    try:
+        results = [run(s) for s in specs]
+    except CostError as err:
+        results = []
+        with col_out:
+            st.error(str(err), icon=":material/error:")
+
+    if results and add_clicked:
+        add_specs([{kk: v for kk, v in s.items() if v is not None} for s in specs])
+        st.toast(f"{tag} agregado a la planta", icon=":material/check_circle:")
+        st.rerun()
+
+    # --- Resultados -----------------------------------------------------------
+    if results:
+        with col_out:
+            main = results[0]
+            total_now = sum(r.at(cepci) for r in results)
+            internals_label = specs[1]["tag"].split(" · ")[-1] if len(specs) > 1 else None
+            sub = [eq.name, f"{theme.num(main.capacity)} {eq.unit}",
+                   main.material.label if len(eq.materials) > 1 else None,
+                   f"{pressure:g} barg" if eq.has_pressure else None,
+                   f"{units} unidades" if units > 1 else None,
+                   f"con {internals_label}" if internals_label else None]
+            factors = [("C<sub>p</sub>° compra, USD 2001", theme.money(main.Cp0))]
+            if eq.method in ("B1B2", "vessel"):
+                factors += [("F<sub>M</sub> material", f"{main.FM:.2f}"),
+                            ("F<sub>P</sub> presión", f"{main.FP:.3f}"),
+                            ("F<sub>BM</sub> módulo", f"{main.FBM:.2f}")]
+            elif eq.method == "FBM_FP":
+                factors += [("F<sub>BM</sub> módulo", f"{main.FBM:.2f}"),
+                            ("F<sub>P</sub> presión", f"{main.FP:.3f}")]
+            elif eq.method == "tray":
+                factors += [("N platos", f"{main.trays}"), ("F<sub>q</sub> cantidad", f"{main.Fq:.3f}"),
+                            ("F<sub>BM</sub> módulo", f"{main.FBM:.2f}")]
+            else:
+                factors += [("F<sub>BM</sub> módulo", f"{main.FBM:.2f}")]
+            if main.thickness is not None:
+                factors.append(("Espesor de pared", f"{main.thickness * 1000:,.1f} mm"))
+            factors.append(("C°<sub>BM</sub> base",
+                            theme.money_short(sum(r.CBM0 for r in results) * cepci / CEPCI_BASE, fx)))
+
+            theme.hero(
+                f"Costo de módulo desnudo · C<sub>BM</sub> · CEPCI {theme.esc(cepci_text)}",
+                theme.money(total_now, fx), currency,
+                " · ".join(s for s in sub if s), factors,
+            )
+
+            if len(results) > 1:
+                st.space("small")
+                st.dataframe(
+                    pd.DataFrame([{
+                        "Componente": s["tag"],
+                        "Equipo": r.equipment.name,
+                        "Tamaño": f"{theme.num(r.capacity)} {r.equipment.unit}",
+                        "F_BM": round(r.FBM, 2),
+                        f"C_BM ({currency})": round(r.at(cepci) * fx),
+                    } for s, r in zip(specs, results)]),
+                    hide_index=True, width="stretch",
+                    column_config={f"C_BM ({currency})": st.column_config.NumberColumn(format="localized")},
+                )
+
+            seen = set()
+            for r in results:
+                for n in r.notices:
+                    if n.text in seen:
+                        continue
+                    seen.add(n.text)
+                    if n.level == "warning":
+                        st.warning(n.text, icon=":material/warning:")
+                    else:
+                        theme.note(n.text)
+
+            # Cascada
+            theme.section("De dónde sale el costo",
+                          "Compra a condiciones base, instalación, efecto del material y la presión, "
+                          "e inflación hasta el CEPCI elegido.")
+            steps = {}
+            for r in results:
+                for name, v in r.breakdown(cepci):
+                    steps[name] = steps.get(name, 0.0) + v * fx
+            st.plotly_chart(
+                charts.waterfall(list(steps.items()), "C<sub>BM</sub> hoy", fmt, currency),
+                config={"displayModeBar": False}, key="wf",
+            )
+
+            # Sensibilidad
+            theme.section("Sensibilidad", "Cómo cambia el costo de módulo del equipo principal al "
+                                          "mover una sola variable. La línea punteada es extrapolación.")
+            options = ["Capacidad"]
+            if eq.has_pressure:
+                options.append("Presión")
+            if len(eq.materials) > 1:
+                options.append("Material")
+            options.append("Año")
+            view = st.segmented_control("Variable", options, default="Capacidad",
+                                        key=f"sens_{k}", label_visibility="collapsed") or "Capacidad"
+
+            base_kw = {kk: main_spec[kk] for kk in ENGINE_KEYS if main_spec.get(kk) is not None}
+            y_title = f"C<sub>BM</sub> ({currency})"
+
+            def sweep_cost(**over):
+                return cost(**{**base_kw, **over})
+
+            if view == "Capacidad":
+                lo, hi = min(eq.a_min, main.capacity), max(eq.a_max, main.capacity)
+                log_x = hi / lo > 20
+                n = 90
+                xs = ([lo * (hi / lo) ** (i / (n - 1)) for i in range(n)] if log_x
+                      else [lo + (hi - lo) * i / (n - 1) for i in range(n)])
+                over = {"length": None} if eq.method == "vessel" else {}
+                ys = [sweep_cost(capacity=x, **over).at(cepci) * fx for x in xs]
+                valid = [eq.a_min <= x <= eq.a_max for x in xs]
+                fig = charts.sweep(xs, ys, valid, (main.capacity, main.at(cepci) * fx),
+                                   x_title=f"{eq.attribute} por unidad ({eq.unit})",
+                                   y_title=y_title, log_x=log_x)
+            elif view == "Presión":
+                if eq.method == "vessel":
+                    p_hi = max(40.0, 1.4 * pressure)
+                else:
+                    p_hi = max(1.3 * eq.pressure_limit, 1.15 * pressure)
+                ps = [p_hi * i / 120 for i in range(121)]
+                rs = [sweep_cost(pressure=p) for p in ps]
+                if eq.method == "vessel":
+                    valid = [(r.thickness or 0) <= 0.25 * diameter for r in rs]
+                else:
+                    valid = [p <= eq.pressure_option(option).p_max for p in ps]
+                fig = charts.sweep(ps, [r.at(cepci) * fx for r in rs], valid,
+                                   (pressure, main.at(cepci) * fx),
+                                   x_title="Presión (barg)", y_title=y_title, log_x=False,
+                                   hover_extra=[f"<br>F_P = {r.FP:.3f}" for r in rs])
+            elif view == "Material":
+                rs = [sweep_cost(material=m.code) for m in eq.materials]
+                fig = charts.material_bars([m.code for m in eq.materials],
+                                           [r.at(cepci) * fx for r in rs], material, fmt,
+                                           currency, fname, [m.factor for m in eq.materials])
+            else:
+                yrs = sorted(CEPCI)
+                vals = [main.CBM * CEPCI[y] / CEPCI_BASE * fx for y in yrs]
+                sel = (cepci_year, main.at(cepci) * fx) if cepci_year else None
+                fig = charts.cepci_line(yrs, vals, sel, y_title, f"CEPCI {cepci_text}")
+            st.plotly_chart(fig, config={"displayModeBar": False}, key=f"sens_fig_{view}")
+
+            # Paso a paso
+            with st.expander("Cálculo paso a paso", icon=":material/functions:"):
+                lA = math.log10(main.capacity)
+                st.markdown("**1. Costo de compra a condiciones base** (Ec. A.1, CEPCI = 397)")
+                st.latex(
+                    rf"\log_{{10}} C_p^\circ = {eq.K1} {eq.K2:+} \log_{{10}}({theme.num(main.capacity)})"
+                    rf" {eq.K3:+} [\log_{{10}}({theme.num(main.capacity)})]^2 = "
+                    rf"{eq.K1 + eq.K2 * lA + eq.K3 * lA * lA:.4f}".replace(",", "{,}")
+                )
+                st.latex(rf"C_p^\circ = \${main.Cp0:,.0f}".replace(",", "{,}"))
+
+                st.markdown("**2. Factor de presión**")
+                if eq.method == "vessel":
+                    if pressure < -0.5:
+                        st.latex(r"P < -0.5\ \text{barg} \Rightarrow F_P = 1.25")
+                    else:
+                        Pd = pressure + VESSEL_GAUGE_OFFSET
+                        st.latex(
+                            rf"F_P = \frac{{\dfrac{{(P+1)\,D}}{{2\,[S E - 0.6\,(P+1)]}} + CA}}{{t_{{min}}}}"
+                            rf" = \frac{{\dfrac{{{Pd:g}\times{diameter:g}}}{{2\,[{VESSEL_S_BAR:g}"
+                            rf"\times{VESSEL_E:g} - 0.6\times{Pd:g}]}} + {VESSEL_CA_M}}}{{{VESSEL_TMIN_M}}}"
+                            rf" = {main.FP:.3f}"
+                        )
+                        st.caption("Ec. A.2 con (P + 1), como en los Ejemplos 7.13 y 7.14. "
+                                   "Si el resultado es menor que 1, F_P = 1.")
+                elif eq.has_pressure:
+                    opt = eq.pressure_option(option)
+                    band = next((b for b in opt.bands if pressure <= b.p_max), opt.bands[-1])
+                    if pressure <= 0 or band.is_flat:
+                        st.latex(rf"P = {pressure:g}\ \text{{barg}} \Rightarrow F_P = 1")
+                    else:
+                        lP = math.log10(pressure)
+                        st.latex(
+                            rf"\log_{{10}} F_P = {band.C1:g} {band.C2:+g}\log_{{10}}({pressure:g})"
+                            rf" {band.C3:+g}[\log_{{10}}({pressure:g})]^2"
+                            rf" = {band.C1 + band.C2 * lP + band.C3 * lP * lP:.4f}"
+                        )
+                        st.latex(rf"F_P = {main.FP:.3f}")
+                    st.caption(f"Tabla A.2 · {opt.label}.")
+                else:
+                    st.markdown("No aplica para este equipo: F_P = 1.")
+
+                st.markdown("**3. Costo de módulo desnudo** (" + METHOD_SOURCE[eq.method] + ")")
+                st.latex(METHOD_EQUATION[eq.method])
+                if eq.method in ("B1B2", "vessel"):
+                    st.latex(rf"F_{{BM}} = {eq.B1} + {eq.B2}\times{main.FM:.2f}\times{main.FP:.3f}"
+                             rf" = {main.FBM:.3f}")
+                elif eq.method == "tray":
+                    st.latex(rf"N = {main.trays},\quad F_q = {main.Fq:.3f},\quad F_{{BM}} = {main.FBM:.2f}")
+                st.latex(rf"C_{{BM}}(2001) = {units}\times\${main.CBM_unit:,.0f} = \${main.CBM:,.0f}"
+                         .replace(",", "{,}"))
+
+                st.markdown("**4. Actualización por inflación** (Ec. 7.4)")
+                st.latex(rf"C_{{BM}} = \${main.CBM:,.0f}\times\frac{{{cepci:.1f}}}{{397}} = "
+                         rf"\${main.at(cepci):,.0f}\ \text{{USD}}".replace(",", "{,}"))
+                if currency == "MXN":
+                    st.latex(rf"\${main.at(cepci):,.0f}\ \text{{USD}}\times{fx:.2f} = "
+                             rf"\${main.at(cepci) * fx:,.0f}\ \text{{MXN}}".replace(",", "{,}"))
 
 
-# ============================================================
-# TAB 3: Análisis gráfico
-# ============================================================
-with tab_charts:
-    chart_col1, chart_col2 = st.columns(2)
+# ===========================================================================
+# Pestaña 2: planta
+# ===========================================================================
 
-    with chart_col1:
-        # Evolución temporal
-        st.markdown("##### Evolución temporal del costo")
-        years, costs = cost_evolution(
-            category, equip_name, A, material, P, D, N,
-            pressure_side=pressure_side,
+with tab_plant:
+    if not ss.plant:
+        theme.empty_state(
+            "La planta todavía no tiene equipos",
+            "Costea un equipo en la pestaña «Equipo» y agrégalo, abre un proyecto guardado "
+            "o carga el Ejemplo 7.14 de Turton para ver cómo se arma un estimado completo.")
+        _, c1, c2, _ = st.columns([1, 1.1, 1.1, 1])
+        if c1.button("Cargar el Ejemplo 7.14", icon=":material/science:", width="stretch"):
+            add_specs([dict(s) for s in EXAMPLE_714])
+            st.rerun()
+        with c2.popover("Abrir proyecto", icon=":material/folder_open:", width="stretch"):
+            upload = st.file_uploader("Proyecto de COSTIQ (.json)", type=["json"],
+                                      key="upload_empty")
+    else:
+        upload = None
+        rows = []
+        bad = []
+        for spec in ss.plant:
+            try:
+                rows.append((spec, run(spec)))
+            except (CostError, KeyError) as err:
+                bad.append(f"{spec.get('tag', '?')}: {err}")
+        for b in bad:
+            st.error(f"No se pudo costear {b}", icon=":material/error:")
+
+        results = [r for _, r in rows]
+        s = plant_summary(results, cepci, f_cont, f_fee, f_aux)
+
+        theme.kpis([
+            dict(label="Módulo desnudo, ΣC<sub>BM</sub>", value=theme.money(s.CBM, fx),
+                 currency=currency, detail=f"{len(rows)} partidas · CEPCI {theme.esc(cepci_text)}"),
+            dict(label="Módulo total, C<sub>TM</sub>", value=theme.money(s.CTM, fx),
+                 currency=currency,
+                 detail=f"ΣC<sub>BM</sub> × (1 + {f_cont:.0%} + {f_fee:.0%}) · Ec. 7.15 · ampliaciones"),
+            dict(label="Grassroots, C<sub>GR</sub>", value=theme.money(s.CGR, fx),
+                 currency=currency, main=True,
+                 detail=f"C<sub>TM</sub> + {f_aux:.0%} ΣC°<sub>BM</sub> · Ec. 7.16 · planta nueva"),
+        ])
+
+        theme.section("Composición del costo grassroots")
+        st.plotly_chart(charts.composition([
+            ("Módulo desnudo", s.CBM * fx, charts.SERIES_1),
+            ("Contingencia y honorarios", (s.contingency + s.fee) * fx, charts.SERIES_2),
+            ("Instalaciones auxiliares", s.auxiliary * fx, charts.SERIES_3),
+        ], fmt, currency), config={"displayModeBar": False}, key="composition")
+
+        theme.section("Inventario de equipos",
+                      "Selecciona filas para quitarlas. Los costos se recalculan con el CEPCI y "
+                      "la moneda de la barra lateral.")
+        total_cbm = s.CBM or 1.0
+        df = pd.DataFrame([{
+            "Etiqueta": spec["tag"],
+            "Equipo": r.equipment.name,
+            "Tamaño": f"{theme.num(r.capacity)} {r.equipment.unit}",
+            "Material": r.material.code,
+            "P (barg)": spec.get("pressure", 0.0) if r.equipment.has_pressure else float("nan"),
+            "Unid.": r.units,
+            "F_BM": round(r.FBM, 2),
+            f"C_BM ({currency})": round(r.at(cepci) * fx),
+            f"C°_BM ({currency})": round(r.CBM0 * cepci / CEPCI_BASE * fx),
+            "% de ΣC_BM": r.at(cepci) / total_cbm * 100,
+        } for spec, r in rows])
+        event = st.dataframe(
+            df, hide_index=True, width="stretch", on_select="rerun",
+            selection_mode="multi-row", key="plant_table",
+            column_config={
+                f"C_BM ({currency})": st.column_config.NumberColumn(format="localized"),
+                f"C°_BM ({currency})": st.column_config.NumberColumn(format="localized"),
+                "% de ΣC_BM": st.column_config.ProgressColumn(
+                    format="%.1f %%", min_value=0, max_value=100, width="small"),
+                "P (barg)": st.column_config.NumberColumn(format="%.1f"),
+            },
         )
-        costs_display = [c * fx for c in costs]
+        selected_rows = event.selection.rows if event else []
 
-        fig_evo = go.Figure()
-        fig_evo.add_trace(go.Scatter(
-            x=years, y=costs_display,
-            mode="lines+markers",
-            name="C_BM",
-            line=dict(color="#2e86c1", width=2.5),
-            marker=dict(size=4),
-            fill="tozeroy",
-            fillcolor="rgba(46, 134, 193, 0.08)",
-        ))
-        fig_evo.add_trace(go.Scatter(
-            x=[cepci_year], y=[CBM_display],
-            mode="markers",
-            name=f"Año {cepci_year}",
-            marker=dict(color="#e74c3c", size=14, symbol="diamond",
-                        line=dict(width=2, color="white")),
-        ))
-        fig_evo.update_layout(
-            xaxis_title="Año",
-            yaxis_title=f"C_BM ({currency})",
-            template="plotly_dark",
-            height=400,
-            margin=dict(l=10, r=10, t=10, b=10),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            font=dict(size=11),
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-        )
-        st.plotly_chart(fig_evo, use_container_width=True)
+        c1, c2, c3, c4, c5 = st.columns([1.15, 1, 1, 1.1, 1.1])
+        if c1.button(f"Quitar ({len(selected_rows)})", icon=":material/delete:",
+                     disabled=not selected_rows, width="stretch",
+                     help="Quita las filas seleccionadas en la tabla."):
+            ids = {rows[i][0]["id"] for i in selected_rows}
+            ss.plant = [p for p in ss.plant if p["id"] not in ids]
+            st.rerun()
+        if c2.button("Vaciar planta", icon=":material/restart_alt:", width="stretch"):
+            ss.plant = []
+            st.rerun()
 
-    with chart_col2:
-        # Sensibilidad al tamaño
-        st.markdown("##### Sensibilidad al tamaño (capacidad)")
-        A_min = equip_data["min"]
-        A_max = equip_data["max"]
-        n_points = 60
-        if A_max / A_min > 100:
-            A_values = [A_min * (A_max / A_min) ** (i / (n_points - 1))
-                        for i in range(n_points)]
-        else:
-            step = (A_max - A_min) / (n_points - 1)
-            A_values = [A_min + i * step for i in range(n_points)]
+        export = pd.DataFrame([{
+            "Etiqueta": spec["tag"], "Clave": r.equipment.key, "Equipo": r.equipment.name,
+            "Categoría": r.equipment.category, "Capacidad": r.capacity,
+            "Unidad": r.equipment.unit, "Unidades": r.units, "Material": r.material.code,
+            "Presión (barg)": spec.get("pressure"), "Diámetro (m)": spec.get("diameter"),
+            "Longitud (m)": spec.get("length"), "Platos": r.trays, "F_M": r.FM, "F_P": r.FP,
+            "F_BM": r.FBM, "F_q": r.Fq, "Cp0 por unidad (USD 2001)": round(r.Cp0, 2),
+            "C_BM (USD 2001)": round(r.CBM, 2), "C0_BM (USD 2001)": round(r.CBM0, 2),
+            "CEPCI": cepci, f"C_BM ({currency})": round(r.at(cepci) * fx, 2),
+        } for spec, r in rows])
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        c3.download_button("CSV", export.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"costiq_planta_{stamp}.csv", mime="text/csv",
+                           icon=":material/table_view:", width="stretch")
+        project = {"costiq": __version__, "fecha": datetime.now().isoformat(timespec="seconds"),
+                   "cepci": cepci, "equipos": [{kk: v for kk, v in p.items() if kk != "id"}
+                                               for p in ss.plant]}
+        c4.download_button("Guardar proyecto", json.dumps(project, ensure_ascii=False, indent=2),
+                           file_name=f"costiq_proyecto_{stamp}.json", mime="application/json",
+                           icon=":material/save:", width="stretch")
+        with c5.popover("Abrir proyecto", icon=":material/folder_open:", width="stretch"):
+            upload = st.file_uploader("Proyecto de COSTIQ (.json)", type=["json"],
+                                      key="upload_full")
+            st.caption("Reemplaza la planta actual.")
 
-        costs_sens = []
-        for a_val in A_values:
-            r = calc_cost(category, equip_name, a_val, material, P, D, N, cepci_year,
-                          pressure_side=pressure_side)
-            costs_sens.append(r["CBM_updated"] * fx)
+        theme.section("¿Qué equipo pesa más?", "Costo de módulo por partida, de mayor a menor.")
+        st.plotly_chart(charts.pareto([f"{spec['tag']} · {r.equipment.name}" for spec, r in rows],
+                                      [r.at(cepci) * fx for _, r in rows], fmt, currency),
+                        config={"displayModeBar": False}, key="pareto")
 
-        fig_sens = go.Figure()
-        fig_sens.add_trace(go.Scatter(
-            x=A_values, y=costs_sens,
-            mode="lines",
-            name="C_BM vs Capacidad",
-            line=dict(color="#e67e22", width=2.5),
-            fill="tozeroy",
-            fillcolor="rgba(230, 126, 34, 0.08)",
-        ))
-        fig_sens.add_trace(go.Scatter(
-            x=[A], y=[CBM_display],
-            mode="markers",
-            name="Punto actual",
-            marker=dict(color="#e74c3c", size=14, symbol="star",
-                        line=dict(width=2, color="white")),
-        ))
-        fig_sens.update_layout(
-            xaxis_title=equip_data["units"],
-            yaxis_title=f"C_BM ({currency})",
-            template="plotly_dark",
-            height=400,
-            margin=dict(l=10, r=10, t=10, b=10),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            font=dict(size=11),
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-        )
-        if A_max / A_min > 100:
-            fig_sens.update_xaxes(type="log")
-        st.plotly_chart(fig_sens, use_container_width=True)
-
-    # Sensibilidad a presión (solo si aplica)
-    if needs_pressure and (
-        (category in PRESSURE_FACTORS and equip_name in PRESSURE_FACTORS.get(category, {}))
-        or method == "vessel"
-    ):
-        st.markdown("##### Sensibilidad a la presión")
-
-        # Determine pressure range (incluyendo P=0)
-        if method == "vessel":
-            P_values = [0.0] + [i * 2 for i in range(1, 76)]  # 0 to 150 barg
-        elif category in PRESSURE_FACTORS and equip_name in PRESSURE_FACTORS[category]:
-            pf_list = PRESSURE_FACTORS[category][equip_name]
-            p_max = max(pf["range"][1] for pf in pf_list)
-            P_values = [0.0] + [i * p_max / 60 for i in range(1, 61)]
-        else:
-            P_values = [float(i) for i in range(0, 101)]
-
-        costs_p = []
-        fps = []
-        for p_val in P_values:
-            r = calc_cost(category, equip_name, A, material, p_val, D, N, cepci_year,
-                          pressure_side=pressure_side)
-            costs_p.append(r["CBM_updated"] * fx)
-            fps.append(r["FP"])
-
-        fig_p = make_subplots(specs=[[{"secondary_y": True}]])
-        fig_p.add_trace(go.Scatter(
-            x=P_values, y=costs_p,
-            mode="lines",
-            name=f"C_BM ({currency})",
-            line=dict(color="#27ae60", width=2.5),
-        ), secondary_y=False)
-        fig_p.add_trace(go.Scatter(
-            x=P_values, y=fps,
-            mode="lines",
-            name="F_P",
-            line=dict(color="#8e44ad", width=2, dash="dash"),
-        ), secondary_y=True)
-        # Current point
-        fig_p.add_trace(go.Scatter(
-            x=[P], y=[CBM_display],
-            mode="markers",
-            name="Presión actual",
-            marker=dict(color="#e74c3c", size=14, symbol="diamond",
-                        line=dict(width=2, color="white")),
-        ), secondary_y=False)
-        fig_p.update_layout(
-            xaxis_title="Presión (barg)",
-            template="plotly_dark",
-            height=400,
-            margin=dict(l=10, r=10, t=10, b=10),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            font=dict(size=11),
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-        )
-        fig_p.update_yaxes(title_text=f"C_BM ({currency})", secondary_y=False)
-        fig_p.update_yaxes(title_text="F_P", secondary_y=True)
-        st.plotly_chart(fig_p, use_container_width=True)
+    if upload is not None and upload.file_id != ss.last_upload:
+        ss.last_upload = upload.file_id
+        try:
+            data = json.loads(upload.getvalue().decode("utf-8"))
+            items = data["equipos"] if isinstance(data, dict) else data
+            for it in items:
+                if it.get("equipment") not in EQUIPMENT:
+                    raise KeyError(f"equipo desconocido: {it.get('equipment')}")
+                run(it)
+            ss.plant = []
+            add_specs(items)
+            st.toast(f"Proyecto cargado: {len(items)} equipos", icon=":material/check_circle:")
+            st.rerun()
+        except (ValueError, KeyError, TypeError, CostError) as err:
+            st.error(f"No se pudo abrir el proyecto: {err}", icon=":material/error:")
 
 
-# ============================================================
-# TAB 4: Referencia
-# ============================================================
-with tab_reference:
-    ref_col1, ref_col2 = st.columns(2)
+# ===========================================================================
+# Pestaña 3: referencia
+# ===========================================================================
 
-    with ref_col1:
-        st.markdown("##### Índices CEPCI (2001–2024)")
-        cepci_df = pd.DataFrame({
-            "Año": list(CEPCI.keys()),
-            "CEPCI": list(CEPCI.values()),
-            "Ratio vs 2001": [v / CEPCI_BASE for v in CEPCI.values()],
-        })
-        st.dataframe(cepci_df, use_container_width=True, hide_index=True)
+with tab_ref:
+    c1, c2 = st.columns([0.55, 0.45], gap="large")
+    with c1:
+        theme.section("Cómo calcula COSTIQ")
+        st.markdown("**1. Costo de compra** a acero al carbón y presión ambiente (Ec. A.1, "
+                    "Tabla A.1), en USD con CEPCI = 397.")
+        st.latex(r"\log_{10} C_p^\circ = K_1 + K_2 \log_{10} A + K_3 (\log_{10} A)^2")
+        st.markdown("**2. Factor de presión.** Recipientes y torres usan la Ec. A.2; el resto, "
+                    "la Ec. A.3 con la Tabla A.2.")
+        st.latex(r"F_{P} = \frac{\dfrac{(P+1)D}{2[SE-0.6(P+1)]} + CA}{t_{min}}")
+        st.latex(r"\log_{10} F_P = C_1 + C_2 \log_{10} P + C_3 (\log_{10} P)^2")
+        st.markdown("**3. Costo de módulo desnudo.** Intercambiadores, recipientes y bombas "
+                    "usan la Ec. A.4; el resto, la Tabla A.5.")
+        st.latex(r"C_{BM} = C_p^\circ(B_1 + B_2 F_M F_P)")
+        st.latex(r"C_{BM} = C_p^\circ F_{BM} F_P \qquad C_{BM} = C_p^\circ N F_{BM} F_q")
+        st.markdown("**4. Inflación** con el CEPCI elegido (Ec. 7.4).")
+        st.latex(r"C_{BM}(\text{año}) = C_{BM}(2001)\,\frac{CEPCI_{\text{año}}}{397}")
+        st.markdown("**5. Planta** (Ecs. 7.15 y 7.16). C°_BM es el costo de módulo con "
+                    "F_M = F_P = 1, es decir, a condiciones base.")
+        st.latex(r"C_{TM} = 1.18\sum C_{BM,i}")
+        st.latex(r"C_{GR} = C_{TM} + 0.50\sum C^\circ_{BM,i}")
 
-        # CEPCI chart
-        fig_cepci = go.Figure()
-        fig_cepci.add_trace(go.Bar(
-            x=list(CEPCI.keys()),
-            y=list(CEPCI.values()),
-            marker_color=["#2e86c1" if y != cepci_year else "#e74c3c"
-                          for y in CEPCI.keys()],
-        ))
-        fig_cepci.update_layout(
-            xaxis_title="Año",
-            yaxis_title="CEPCI",
-            template="plotly_dark",
-            height=300,
-            margin=dict(l=10, r=10, t=10, b=10),
-            font=dict(size=10),
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-        )
-        st.plotly_chart(fig_cepci, use_container_width=True)
-
-    with ref_col2:
-        st.markdown("##### Catálogo de equipos disponibles")
-        equip_count = []
-        for cat, equips in EQUIPMENT.items():
-            for eq_name, eq_data in equips.items():
-                equip_count.append({
-                    "Categoría": cat,
-                    "Equipo": eq_name,
-                    "Unidades": eq_data["units"],
-                    "Mín": eq_data["min"],
-                    "Máx": eq_data["max"],
-                    "Método": COST_METHOD[cat],
-                })
-        df_catalog = pd.DataFrame(equip_count)
-        st.dataframe(df_catalog, use_container_width=True, hide_index=True, height=400)
-
-        st.markdown("##### Métodos de costeo")
+    with c2:
+        theme.section("Decisiones y supuestos de esta versión")
         st.markdown("""
-| Método | Ecuación | Aplica a |
-|--------|----------|----------|
-| **B1B2** | C_BM = Cp° × (B₁ + B₂·F_M·F_P) | HX, Bombas |
-| **vessel** | F_P por Eq. A.2 + B1B2 | Torres, Recipientes |
-| **FBM** | C_BM = Cp° × F_BM | Compresores, Turbinas, Reactores, Tanques |
-| **FBM_FP** | C_BM = Cp° × F_BM × F_P | Hornos |
-| **tray** | C_BM = Cp° × N × F_BM × F_q | Platos |
+- **Ec. A.2 con (P + 1).** La 5.ª edición imprime P, pero sus Ejemplos 7.13 y 7.14 usan
+  (P + 1). COSTIQ sigue los ejemplos y los reproduce dentro de 0.5 %.
+- **Factores de figura.** F_M (Fig. A.18) y F_BM (Fig. A.19) se digitalizaron de las
+  gráficas del libro, con ±0.03 a ±0.04 de resolución.
+- **Fuera de rango.** Capacidad y presión fuera de la correlación se extrapolan y se
+  marcan; F_P nunca baja al pasar el límite tabulado.
+- **Tanques API.** El libro no da F_BM; COSTIQ supone 1.0 y permite cambiarlo.
+- **Reactores.** F_BM = 4.0 es una estimación del libro (Tabla A.7).
+- **Compresores.** Se costean sin accionamiento; el motor o la turbina va aparte.
 """)
+        theme.section("Cita")
+        st.code("Turton, R., Shaeiwitz, J. A., Bhattacharyya, D., & Whiting, W. B. (2018).\n"
+                "Analysis, Synthesis, and Design of Chemical Processes (5th ed.).\n"
+                "Pearson. Appendix A.", language=None, wrap_lines=True)
 
-        st.markdown("##### Referencia bibliográfica")
-        st.info(
-            "Turton, R., Shaeiwitz, J.A., Bhattacharyya, D., Whiting, W.B. "
-            "*Analysis, Synthesis, and Design of Chemical Processes*, 5th Ed. "
-            "Prentice Hall, 2018. **Apéndice A.**"
-        )
+    theme.section("Catálogo de equipos", f"{len(EQUIPMENT_LIST)} tipos en "
+                                          f"{len(CATEGORIES)} categorías.")
+    cat_filter = st.segmented_control("Categoría", ["Todas"] + list(CATEGORIES), default="Todas",
+                                      key="ref_cat", label_visibility="collapsed") or "Todas"
+    st.dataframe(pd.DataFrame([{
+        "Categoría": e.category, "Equipo": e.name, "Nombre en Turton": e.name_en,
+        "Atributo": f"{e.attribute} ({e.unit})", "Mín.": e.a_min, "Máx.": e.a_max,
+        "K₁": e.K1, "K₂": e.K2, "K₃": e.K3, "Método": METHOD_LABEL[e.method],
+        "Materiales": len(e.materials),
+    } for e in EQUIPMENT_LIST if cat_filter in ("Todas", e.category)]),
+        hide_index=True, width="stretch",
+        column_config={"Método": st.column_config.TextColumn(width="medium"),
+                       **{c: st.column_config.NumberColumn(format="%.5g")
+                          for c in ("K₁", "K₂", "K₃", "Mín.", "Máx.")}})
 
+    c1, c2 = st.columns([0.5, 0.5], gap="large")
+    with c1:
+        theme.section("Factores de material o de módulo",
+                      "Con su identificador en las Tablas A.3 y A.6.")
+        ref_key = st.selectbox("Equipo", [e.key for e in EQUIPMENT_LIST],
+                               format_func=lambda x: f"{EQUIPMENT[x].category} · {EQUIPMENT[x].name}",
+                               key="ref_eq", label_visibility="collapsed")
+        re_eq = EQUIPMENT[ref_key]
+        st.dataframe(pd.DataFrame([{
+            "Material": m.label, "Código": m.code, factor_name(re_eq.method): m.factor,
+            "Fuente": m.ref,
+        } for m in re_eq.materials]), hide_index=True, width="stretch")
+        if re_eq.pressure:
+            st.dataframe(pd.DataFrame([{
+                "Correlación": opt.label, "Hasta (barg)": b.p_max,
+                "C₁": b.C1, "C₂": b.C2, "C₃": b.C3,
+            } for opt in re_eq.pressure for b in opt.bands]), hide_index=True, width="stretch",
+                column_config={c: st.column_config.NumberColumn(format="%.6g")
+                               for c in ("C₁", "C₂", "C₃")})
+    with c2:
+        theme.section("Índice CEPCI", "Promedios anuales; 2002–2024 pendientes de verificar "
+                                       "contra la fuente primaria.")
+        st.plotly_chart(charts.cepci_index(sorted(CEPCI), [CEPCI[y] for y in sorted(CEPCI)],
+                                           CEPCI_BASE),
+                        config={"displayModeBar": False}, key="cepci_ref")
 
-# ============================================================
-# Pie de página
-# ============================================================
-st.markdown("---")
-st.markdown("""
-<div class="credits">
-    <strong>COSTIQ — Costeo de Equipos de Proceso</strong><br>
-    Desarrollado por:
-    Oscar Daniel Lara-Montaño ·
-    Fernando Israel Gómez-Castro ·
-    Sergio Iván Martínez-Guido<br>
-    Universidad Autónoma de Querétaro · Universidad de Guanajuato<br><br>
-    <em>Si encuentra algún error o bug, por favor repórtelo en
-    <a href="https://github.com/lara-montano/estimador_costos/issues">
-    github.com/lara-montano/estimador_costos/issues</a></em>
-</div>
-""", unsafe_allow_html=True)
+theme.footer(__version__)

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "costiq"
+version = "2.0.0"
+description = "Estimación de costos de equipo de proceso con el método de módulo de Turton et al. (2018)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Oscar Daniel Lara-Montaño" },
+    { name = "Fernando Israel Gómez-Castro" },
+    { name = "Sergio Iván Martínez-Guido" },
+]
+dependencies = []
+
+[project.optional-dependencies]
+app = ["streamlit>=1.50,<2", "plotly>=6.0,<7", "pandas>=2.0,<3"]
+test = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["costiq"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
