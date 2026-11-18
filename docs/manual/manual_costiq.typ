@@ -13,6 +13,7 @@
 #let fecha = "18 de noviembre de 2026"
 #let repo = "https://github.com/lara-montano/COSTIQ"
 #let zip = "https://github.com/lara-montano/COSTIQ/archive/refs/heads/main.zip"
+#let app = "https://costiq.streamlit.app"
 
 #set document(
   title: "COSTIQ: manual de instalación y uso",
@@ -78,8 +79,8 @@
     block(width: 100%, inset: (x: 9pt, top: 7pt, bottom: 9pt), cuerpo),
   ),
 )
-#let sistemas(win, mac) = grid(columns: (1fr, 1fr), column-gutter: 10pt,
-  panel("Windows", win), panel("Mac", mac))
+#let sistemas(win, mac) = block(breakable: false, grid(columns: (1fr, 1fr), column-gutter: 10pt,
+  panel("Windows", win), panel("Mac", mac)))
 // Recuadros de nota y de aviso.
 #let recuadro(color, fondo-color, titulo, cuerpo) = block(
   width: 100%, fill: fondo-color, inset: (x: 10pt, y: 8pt), radius: (right: 4pt),
@@ -89,8 +90,8 @@
 #let nota(titulo, cuerpo) = recuadro(azul, azul-claro, titulo, cuerpo)
 #let aviso(titulo, cuerpo) = recuadro(naranja, naranja-claro, titulo, cuerpo)
 // Captura de pantalla con marco.
-#let captura(ruta, alt, pie) = figure(
-  box(stroke: 0.6pt + borde, radius: 4pt, clip: true, image(ruta, width: 100%, alt: alt)),
+#let captura(ruta, alt, pie, ancho: 100%) = figure(
+  box(width: ancho, stroke: 0.6pt + borde, radius: 4pt, clip: true, image(ruta, width: 100%, alt: alt)),
   caption: pie,
 )
 
@@ -104,7 +105,30 @@
   #text(size: 9.5pt, fill: gris)[Windows y Mac · COSTIQ #version · #fecha]
 ]
 
-COSTIQ estima el costo de equipo de proceso con el método de módulo de Turton et al. (2018). Corre en tu computadora y se usa desde el navegador. No necesitas saber programar: sigue los cuatro pasos de este manual.
+COSTIQ estima el costo de equipo de proceso con el método de módulo de Turton et al. (2018). Se usa desde el navegador y no necesitas saber programar. Hay dos formas de usarla: en línea (opción A) o instalada en tu computadora (opción B).
+
+= Opción A. En línea, sin instalar nada
+
+Es la forma más rápida. Solo necesitas internet y un navegador.
+
++ Abre #link(app)[*costiq.streamlit.app*] en Chrome, Edge, Safari o Firefox.
++ Si la página dice que la app está dormida, haz clic en #ui("Yes, get this app back up!") y espera a que cargue. Pasa cuando nadie la ha usado en 12 horas.
++ Úsala como explica el paso 4. Antes de cerrar la pestaña, guarda tu trabajo con #ui("Guardar proyecto").
+
+#nota("¿No carga o no tienes internet?")[
+  Instala COSTIQ en tu computadora con la opción B. Funciona igual y, ya instalada, no necesita internet.
+]
+
+#captura("img/app_equipo.png",
+  "Pantalla de COSTIQ en la pestaña Equipo, con la barra lateral a la izquierda y el costo del equipo a la derecha.",
+  [COSTIQ al abrir, en línea o en tu computadora. A la izquierda, la barra lateral con el CEPCI y la moneda. Arriba, las pestañas Equipo, Planta y Referencia. A la derecha, el costo de módulo del equipo elegido y la cascada que lo explica.],
+)
+
+#pagebreak(weak: true)
+
+= Opción B. Instalada en tu computadora
+
+Son cuatro pasos. Los tres primeros solo se hacen una vez.
 
 #nota("Antes de empezar.")[
   Necesitas una computadora con Windows 10 u 11, o una Mac con macOS 12 o más reciente; conexión a internet para la primera instalación; unos 600 MB libres; y 15 minutos. Después de la primera vez, COSTIQ abre en segundos.
@@ -200,16 +224,11 @@ Sabrás que funcionó cuando el navegador muestre COSTIQ en la dirección `http:
 - *Cerrar:* en Windows, cierra la ventana negra. En Mac, presiona #tecla("control") + #tecla("C") en Terminal y luego cierra la ventana. Cerrar la pestaña del navegador no apaga COSTIQ.
 - *Volver a abrir:* repite este paso 3. Ya no instala nada y abre en segundos.
 
-#captura("img/app_equipo.png",
-  "Pantalla de COSTIQ en la pestaña Equipo, con la barra lateral a la izquierda y el costo del equipo a la derecha.",
-  [COSTIQ recién abierto. A la izquierda, la barra lateral con el CEPCI y la moneda. Arriba, las pestañas Equipo, Planta y Referencia. A la derecha, el costo de módulo del equipo elegido y la cascada que lo explica.],
-)
-
 // --- Paso 4 ---------------------------------------------------------------
 
 #paso(4, "Usar COSTIQ", "Guarda antes de cerrar")
 
-COSTIQ tiene una barra lateral y tres pestañas.
+Esta parte sirve para las dos opciones. COSTIQ tiene una barra lateral y tres pestañas.
 
 #table(
   columns: (auto, 1fr),
@@ -243,6 +262,7 @@ COSTIQ tiene una barra lateral y tres pestañas.
 #captura("img/app_planta.png",
   "Pestaña Planta con siete equipos, los costos de planta, la composición del costo grassroots y el inventario.",
   [Pestaña Planta con el Ejemplo 7.14 de Turton cargado: costos de planta arriba, composición del C#sub[GR] y el inventario de equipos con los botones para quitar, guardar y exportar.],
+  ancho: 84%,
 )
 
 == Consejos
@@ -263,6 +283,12 @@ COSTIQ tiene una barra lateral y tres pestañas.
   table.hline(stroke: 0.8pt),
   table.header([*Lo que ves*], [*Qué hacer*]),
   table.hline(stroke: 0.5pt),
+  [En línea: la página dice que la app está dormida],
+  [Haz clic en #ui("Yes, get this app back up!") y espera a que cargue.],
+  table.hline(stroke: 0.3pt + borde),
+  [En línea: la página no carga o va muy lenta],
+  [Revisa tu internet. Si sigue igual, usa la opción B: COSTIQ instalada en tu computadora.],
+  table.hline(stroke: 0.3pt + borde),
   [«No encontré Python 3.10 o más reciente»],
   [Instala Python (paso 1). En Windows usa el instalador de 64 bits. Luego abre COSTIQ otra vez.],
   table.hline(stroke: 0.3pt + borde),
@@ -300,6 +326,8 @@ COSTIQ tiene una barra lateral y tres pestañas.
 
 // --- Anexo ----------------------------------------------------------------
 
+#pagebreak(weak: true)
+
 = Anexo: instalación con git y terminal
 
 Esta sección es opcional, para quien ya usa git. Después de clonar el repositorio también puedes usar los lanzadores del paso 3.
@@ -334,5 +362,5 @@ Para actualizar a la versión más reciente, ejecuta `git pull` dentro de la car
 #v(1.2em)
 #line(length: 100%, stroke: 0.5pt + borde)
 #text(size: 8.5pt, fill: gris)[
-  COSTIQ #version · Oscar Daniel Lara-Montaño (Universidad Autónoma de Querétaro), Fernando Israel Gómez-Castro y Sergio Iván Martínez-Guido (Universidad de Guanajuato). Licencia MIT. Método: Turton, R., Shaeiwitz, J. A., Bhattacharyya, D. y Whiting, W. B. (2018). _Analysis, Synthesis, and Design of Chemical Processes_, 5.ª ed., Pearson, Apéndice A. Código fuente: #link(repo)[github.com/lara-montano/COSTIQ].
+  COSTIQ #version · Oscar Daniel Lara-Montaño (Universidad Autónoma de Querétaro), Fernando Israel Gómez-Castro y Sergio Iván Martínez-Guido (Universidad de Guanajuato). Licencia MIT. Método: Turton, R., Shaeiwitz, J. A., Bhattacharyya, D. y Whiting, W. B. (2018). _Analysis, Synthesis, and Design of Chemical Processes_, 5.ª ed., Pearson, Apéndice A. En línea: #link(app)[costiq.streamlit.app]. Código fuente: #link(repo)[github.com/lara-montano/COSTIQ].
 ]
