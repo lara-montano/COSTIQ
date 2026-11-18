@@ -4,6 +4,9 @@ toolbarMode = "minimal"
 [browser]
 gatherUsageStats = false
 
+[server]
+showEmailPrompt = false
+
 [theme]
 base = "light"
 primaryColor = "#1c5cab"

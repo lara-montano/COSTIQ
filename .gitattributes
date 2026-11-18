@@ -1,0 +1,5 @@
+# Finales de línea correctos en el ZIP que se descarga de GitHub
+*.bat     text eol=crlf
+*.command text eol=lf
+*.sh      text eol=lf
+*.typ     text eol=lf
