@@ -2,6 +2,11 @@
 
 ## Sin publicar
 
+### Versión en línea
+
+- Publicada en [costiq.streamlit.app](https://costiq.streamlit.app) (Streamlit Community Cloud, rama `main`, Python 3.13). Con el Ejemplo 7.14 da los mismos ΣC_BM, C_TM y C_GR que la versión local.
+- El manual presenta primero la opción en línea; la instalación local queda como opción B.
+
 ### Instalación
 
 - Lanzadores `iniciar_windows.bat` e `iniciar_mac.command`: buscan un Python compatible, crean `.venv`, instalan los paquetes la primera vez y abren la app.

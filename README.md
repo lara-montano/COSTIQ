@@ -2,6 +2,8 @@
 
 **COSTIQ** (*Costos en Ingeniería Química*) estima el costo de equipo de proceso con el método de módulo de Turton et al. (2018), Apéndice A. Incluye un paquete de Python importable (`costiq`) y una interfaz web en Streamlit.
 
+**Úsala en línea, sin instalar nada: [costiq.streamlit.app](https://costiq.streamlit.app)**
+
 ## Qué calcula
 
 - Costo de compra C_p° de 96 tipos de equipo en 23 categorías (Tabla A.1), incluidos evaporadores, secadores, filtros, centrífugas, cribas, transportadores, mezcladores, calderas y marmitas.
@@ -15,7 +17,11 @@
 
 ## Instalación y uso
 
-Para estudiantes hay un [manual de instalación y uso](docs/manual/manual_costiq.pdf) (PDF, Windows y Mac). En resumen:
+Para estudiantes hay un [manual de instalación y uso](docs/manual/manual_costiq.pdf) (PDF, Windows y Mac).
+
+La forma más rápida es la versión en línea, [costiq.streamlit.app](https://costiq.streamlit.app), publicada en Streamlit Community Cloud desde la rama `main`. Si nadie la usa en 12 horas se duerme; cualquiera la despierta con el botón «Yes, get this app back up!».
+
+Para usarla sin internet, instálala en tu computadora:
 
 1. Instala Python 3.10 o más reciente desde [python.org](https://www.python.org/downloads/). En Windows usa el instalador de 64 bits y marca «Add python.exe to PATH».
 2. Descarga el [ZIP de COSTIQ](https://github.com/lara-montano/COSTIQ/archive/refs/heads/main.zip) y descomprímelo.
