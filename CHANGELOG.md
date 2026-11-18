@@ -1,5 +1,15 @@
 # Registro de cambios
 
+## Sin publicar
+
+### Instalación
+
+- Lanzadores `iniciar_windows.bat` e `iniciar_mac.command`: buscan un Python compatible, crean `.venv`, instalan los paquetes la primera vez y abren la app.
+- `pandas>=2.0,<4`: con `pandas<3` no había instaladores para Python 3.15, la versión que ofrece hoy python.org. La app da la misma salida con pandas 2.3.3 y 3.1.1 (Ejemplo 7.14).
+- Sin la pregunta de correo de Streamlit en el primer arranque (`server.showEmailPrompt = false`).
+- Los lanzadores escuchan solo en `localhost` (sin aviso del firewall de Windows) y desactivan el vigilante de archivos. Con `.venv` dentro de la carpeta, ese vigilante llevaba el arranque a unos 20 s; sin él tarda de 1 a 2 s.
+- Manual para estudiantes en `docs/manual/` (Typst y PDF).
+
 ## 2.1.0 — 2026-11-07
 
 ### Nuevo
