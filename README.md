@@ -15,6 +15,18 @@
 
 ## Instalación y uso
 
+Para estudiantes hay un [manual de instalación y uso](docs/manual/manual_costiq.pdf) (PDF, Windows y Mac). En resumen:
+
+1. Instala Python 3.10 o más reciente desde [python.org](https://www.python.org/downloads/). En Windows usa el instalador de 64 bits y marca «Add python.exe to PATH».
+2. Descarga el [ZIP de COSTIQ](https://github.com/lara-montano/COSTIQ/archive/refs/heads/main.zip) y descomprímelo.
+3. Abre COSTIQ con el lanzador:
+   - Windows: doble clic en `iniciar_windows.bat`.
+   - Mac: en Terminal escribe `bash ` (con espacio), arrastra `iniciar_mac.command` a la ventana y presiona Enter.
+
+La primera vez, el lanzador crea un entorno en `.venv` e instala los paquetes (5 a 10 minutos). Después abre la app en segundos, en `http://localhost:8501`.
+
+Con terminal:
+
 ```bash
 git clone https://github.com/lara-montano/COSTIQ.git
 cd COSTIQ
@@ -62,6 +74,8 @@ costiq/        paquete de cálculo (sin dependencias)
 ui/            estilos y gráficas de la interfaz
 app.py         interfaz Streamlit
 tests/         pruebas contra los ejemplos del libro
+docs/manual/   manual para estudiantes (Typst y PDF)
+iniciar_windows.bat, iniciar_mac.command   lanzadores que instalan y abren la app
 ```
 
 ## Referencia
